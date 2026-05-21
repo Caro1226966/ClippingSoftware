@@ -1,3 +1,5 @@
+import csv
+
 from config import *
 from button_callbacks import *
 
@@ -25,14 +27,21 @@ class MainProgram:
         if self.button_callback.clipping_key is not None:
             pass
 
+    # Writes whatever the input is to wherever it needs to go
     def write_to_file(self,pointer, value):
-        with open('defaults.csv', 'r') as csvfile:
+        updated_file = []
+        with open('defaults.csv', 'r+') as csvfile:
             reader = csv.reader(csvfile)
 
             for line in reader:
                 if line[0] == pointer:
                     line[1] = value
-            print(reader)
 
+                updated_file.append(line) # adds the line as a new component in the list
+
+        # re-writes the file to put in the new values accurately
+        with open('defaults.csv','w',newline='') as csvfile:
+            csvwriter = csv.writer(csvfile)
+            csvwriter.writerows(updated_file)
 
 program = MainProgram()
