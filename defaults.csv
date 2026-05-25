@@ -1,0 +1,5 @@
+clip_key,f8
+clip_length,10
+monitor,0
+fps, 60
+ffmpeg_loc,
