@@ -2,12 +2,25 @@ from config import *
 
 class Callbacks:
     def __init__(self, main):
+        self.main = main # Main Program link
+
 
         # Clipping key flags
         self.clipping_key = CLIP_KEY
         self.setbutton_pressed = False
 
-        self.main = main # Main Program link
+        # Monitor selector flags
+        self.monitor = int(main.read_from_file('monitor'))
+
+        # FPS
+        self.fps = int(main.read_from_file('fps'))
+
+        # Clip Length
+        self.clip_length = int(main.read_from_file('clip_length'))
+
+        # Output
+        self.file_name = self.create_file_name()
+
 
     # Lets the user set the button. Changes text and
     def setbutton(self):
@@ -32,8 +45,15 @@ class Callbacks:
             print(self.clipping_key)
 
             self.setbutton_pressed = False
+            self.main.clip_key_pressed = True
 
 
-    def selectmonitor(self):
-        pass
+    def selectmonitor(self, choice):
+        self.monitor = int(choice[-1])
+
+        print(self.monitor)
+        self.main.write_to_file('monitor',str(self.monitor))
+
+    def create_file_name(self):
+        return str(time.time()) + '.mp4'
 
