@@ -1,5 +1,3 @@
-import threading
-
 from config import *
 from button_callbacks import *
 
@@ -7,7 +5,9 @@ from button_callbacks import *
 class MainProgram(customtkinter.CTk):
     def __init__(self):
         super().__init__()
-        self.geometry(str(int(SCREEN_WIDTH/1.5))+'x'+ str(int(SCREEN_HEIGHT/1.5)))
+        self.geometry(str(500)+'x'+ str(540))
+        self.resizable(False,False)
+        self.title("Caro122's Clipping Software")
 
         # App logic flags
         self.clip_key_pressed = False
@@ -16,72 +16,215 @@ class MainProgram(customtkinter.CTk):
         # Monitor settings
         self.monitor_list = []
 
-        # SCT
+        # FPS
+        self.fps_options = ['10','15','24','30','60','120','240']
+
+        # Clip
+        self.clip_options = ['10s','30s','1m','2m','5m','10m']
+
+        # SCT (main-thread instance is only used for enumerating monitors in the GUI)
         self.sct = mss.MSS()
-        self.video_list = []
-        self.monitor = None
-        self.last_frame_time = time.time()
+        self.monitor = self.sct.monitors[1] if len(self.sct.monitors) > 1 else self.sct.monitors[0]
 
         # Button Callbacks
         self.button_callback = Callbacks(self)
 
-        # The clipping key to choose an active button
-        self.choose_clipping_key = customtkinter.CTkButton(self, text='Select Clip Button',command = self.button_callback.setbutton)
-        self.choose_clipping_key.pack(side="right", anchor="ne", padx=10, pady=30)
+        # Rolling audio capture (mic + computer audio)
+        self.audio = AudioManager(self)
+
+        # Threaded screen capture (keeps the grab/encode off the GUI thread)
+        self.screen = ScreenCapture(self)
+
+        # The colloum that all the UI emelents sit in
+        self.left_column = customtkinter.CTkFrame(self, fg_color="transparent")
+        self.left_column.pack(side="left", fill="y", anchor="nw", padx=30, pady=30)
+
+        # Row for active clipping button UI elements to sit in
+        self.keybind_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.keybind_row.pack(anchor="w", fill="x", pady=(0, 25))
 
         # Text to show what button is the active clipping button
-        self.current_button_text = customtkinter.CTkTextbox(self,width=200, height=30)
-        self.current_button_text.pack(side="right", anchor="ne", padx=20, pady=30) # Padding
+        self.current_button_text = customtkinter.CTkTextbox(self.keybind_row,width=200, height=30)
+        self.current_button_text.pack(side = 'left', anchor="w", padx=10, pady=0) # Padding
         self.current_button_text.insert(index=0.0,text=('Current Key: '+str(self.button_callback.clipping_key))) # Put in the text
         self.current_button_text.configure(state="disabled")
+
+        # The clipping key to choose an active button
+        self.choose_clipping_key = customtkinter.CTkButton(self.keybind_row, text='Select Clip Button',command = self.button_callback.setbutton)
+        self.choose_clipping_key.pack(side = 'left', anchor="w", padx=0, pady=0)
+
+        # Row for monitor selector UI elements to sit in
+        self.monitor_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.monitor_row.pack(anchor="w", fill="x", pady=(0, 25))
 
         # Monitor selector
         for monitor in range(len(self.sct.monitors)-1):
             monitor_num = str(monitor)
-            (self.monitor_list.append
-             (monitor_num))
-        print(self.monitor_list)
+            (self.monitor_list.append(monitor_num))
 
         # Text to show user that dropdown selects the monitor
-        self.current_monitor_text = customtkinter.CTkTextbox(self,width=200, height=30)
-        self.current_monitor_text.pack(side="left", anchor="ne", padx=20, pady=30) # Padding
-        self.current_monitor_text.insert(index=0.0,text='Monitor: ') # Put in the text
+        self.current_monitor_text = customtkinter.CTkLabel(self.monitor_row,width=200, height=30, text='Monitor: ')
+        self.current_monitor_text.pack(side = 'left', anchor="w", padx=0, pady=0) # Padding
         self.current_monitor_text.configure(state="disabled")
 
-        self.monitor_selector = customtkinter.CTkComboBox(self,values=self.monitor_list,
+        self.monitor_selector = customtkinter.CTkComboBox(self.monitor_row,values=self.monitor_list,
                                                           command=self.button_callback.selectmonitor,
                                                           state ='readonly')
         self.monitor_selector.set(self.read_from_file('monitor'))
-        self.monitor_selector.pack(side='left', anchor='nw',pady = 30)
+        self.monitor_selector.pack(side = 'left', anchor='w',pady = 0, padx = 10)
 
-        # Dropdown to select the clip length
-        self.monitor_selector = customtkinter.CTkComboBox(self,values=self.monitor_list,
-                                                          command=self.button_callback.selectmonitor,
+        # Row for monitor selector UI elements to sit in
+        self.fps_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.fps_row.pack(anchor="w", fill="x", pady=(0, 25))
+
+        # Text to show user that dropdown selects the FPS
+        self.current_monitor_text = customtkinter.CTkLabel(self.fps_row,width=200, height=30, text='FPS: ')
+        self.current_monitor_text.pack(side = 'left', anchor="w", padx=0, pady=0) # Padding
+        self.current_monitor_text.configure(state="disabled")
+
+        # Dropdown to select the FPS
+        self.fps_selector = customtkinter.CTkComboBox(self.fps_row,values=self.fps_options,
+                                                          command=self.button_callback.selectfps,
                                                           state ='readonly')
-        self.monitor_selector.set(self.read_from_file('monitor'))
-        self.monitor_selector.pack(side='left', anchor='nw',pady = 30)
+        self.fps_selector.set(self.read_from_file('fps'))
+        self.fps_selector.pack(side = 'left', anchor='w',pady = 0, padx = 10)
+
+        # Row for clip length UI elements to sit in
+        self.length_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.length_row.pack(anchor="w", fill="x", pady=(0, 25))
+
+        # Text to show user that dropdown selects the Clip Length
+        self.current_length_text = customtkinter.CTkLabel(self.length_row, width=200, height=30, text='Clip Length: ')
+        self.current_length_text.pack(side = 'left', anchor="w", padx=0, pady=0)  # Padding
+        self.current_length_text.configure(state="disabled")
+
+        # Dropdown to select the Clip Length
+        self.length_selector = customtkinter.CTkComboBox(self.length_row,values=self.clip_options,
+                                                          command=self.button_callback.selectcliplength,
+                                                          state ='readonly')
+        self.length_selector.set(self.button_callback.get_text_clip_length())
+        self.length_selector.pack(side = 'left', anchor='w',pady = 0, padx = 0)
+
+
+        # Row for microphone UI elements to sit in
+        self.mic_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.mic_row.pack(anchor="w", fill="x", pady=(0, 25))
+
+        # Text to show user that dropdown selects the Microphone
+        self.current_mic_text = customtkinter.CTkLabel(self.mic_row, width=200, height=30, text='Microphone: ')
+        self.current_mic_text.pack(side = 'left', anchor="w", padx=0, pady=0)  # Padding
+        self.current_mic_text.configure(state="disabled")
+
+        # Mic selector
+        self.mic_selector = customtkinter.CTkComboBox(self.mic_row, values = self.get_all_mics(),
+                                                      command=self.button_callback.selectmic,
+                                                      state= 'readonly')
+        self.mic_selector.set(self.read_from_file('mic'))
+        self.mic_selector.pack(side='left', anchor = 'w', pady = 0, padx = 10)
+
+        # Mic tickbox
+        self.mic_tick_box = customtkinter.CTkCheckBox(self.mic_row, width = 60, height = 60,
+                                                      state = 'normal',
+                                                      command=self.button_callback.mic_status_updater,
+                                                      text = '',
+                                                      onvalue=1, offvalue=0,
+                                                      hover = True)
+        self.mic_tick_box.pack(side = 'left', anchor = 'w', pady = 0, padx = 10)
+
+        # Defaults the mic selector to the right value
+        if self.button_callback.mic_enabled == 1:
+            self.mic_tick_box.select()
+        else:
+            self.mic_tick_box.deselect()
+
+        # Row for internal microphone UI elements to sit in
+        self.internal_audio_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.internal_audio_row.pack(anchor="w", fill="x", pady=(0, 25))
+
+        # Text to show user that dropdown selects the Microphone
+        self.internal_audio_text = customtkinter.CTkLabel(self.internal_audio_row, width=200, height=30, text='Computer Audio: ')
+        self.internal_audio_text.pack(side='left', anchor="w", padx=0, pady=0)  # Padding
+        self.internal_audio_text.configure(state="disabled")
+
+        # internal Mic selector
+        self.internal_audio_selector = customtkinter.CTkComboBox(self.internal_audio_row, values=self.get_all_internal_mics(),
+                                                      command=self.button_callback.select_internal_mic,
+                                                      state='readonly')
+        self.internal_audio_selector.set(self.button_callback.current_internal_mic)
+        self.internal_audio_selector.pack(side='left', anchor='w', pady=0, padx=10)
+
+        # Mic tickbox
+        self.button_callback.internal_audio_enabled = customtkinter.IntVar()
+        self.internal_audio_tick_box = customtkinter.CTkCheckBox(self.internal_audio_row, width=60, height=60,
+                                                      state='normal',
+                                                      command=self.button_callback.internal_audio_status_updater,
+                                                      text='',
+                                                      onvalue=1, offvalue=0,
+                                                      hover=True)
+        self.internal_audio_tick_box.pack(side='left', anchor='w', pady=0, padx=10)
+
+        # Defaults the mic selector to the right value
+        if self.button_callback.mic_enabled == 1:
+            self.internal_audio_tick_box.select()
+        else:
+            self.internal_audio_tick_box.deselect()
+
+        # Row for mouse capture UI elements to sit in
+        self.mouse_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.mouse_row.pack(anchor="w", fill="x", pady=(0, 25))
+
+        # Text to show user that the tickbox captures the mouse cursor
+        self.mouse_text = customtkinter.CTkLabel(self.mouse_row, width=200, height=30, text='Capture Mouse: ')
+        self.mouse_text.pack(side='left', anchor="w", padx=0, pady=0)  # Padding
+        self.mouse_text.configure(state="disabled")
+
+        # Mouse tickbox
+        self.mouse_tick_box = customtkinter.CTkCheckBox(self.mouse_row, width=60, height=60,
+                                                      state='normal',
+                                                      command=self.button_callback.mouse_status_updater,
+                                                      text='',
+                                                      onvalue=1, offvalue=0,
+                                                      hover=True)
+        self.mouse_tick_box.pack(side='left', anchor='w', pady=0, padx=10)
+
+        # Defaults the mouse tickbox to the saved value
+        if self.button_callback.mouse_enabled == 1:
+            self.mouse_tick_box.select()
+        else:
+            self.mouse_tick_box.deselect()
 
         # Close to system tray
         self.system_tray_setup()
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
+
+        # Starts the audio + screen recording
+        self.audio.start()
+        self.screen.start()
 
         self.loop() # The program logic
 
         # The mainloop that repeats the code above and keeps the window alive
         self.mainloop()
 
-    # This is the program's main logic loop
+    # This is the program's main logic loop. It stays lightweight: the heavy
+    # screen grabbing/encoding runs on the ScreenCapture thread, so the GUI
+    # never blocks and the clip key stays responsive.
     def loop(self):
-        # print('Called mainloop')
         if keyboard.is_pressed(self.button_callback.clipping_key) and self.clip_key_pressed == False:
             print('Clipping...')
             popup = Popup()
 
-            # Compiling the list into a video clip
-            frames_to_compile = list(self.video_list)
-            self.last_frame_time = time.time()
+            # Grab the buffered frames (this also clears the rolling buffer)
+            frames_to_compile, actual_duration = self.screen.snapshot()
+            if frames_to_compile:
+                # Snapshot the matching audio window before it is cleared
+                clip_audio = self.audio.get_clip_audio(actual_duration)
+            else:
+                clip_audio = None
+            self.audio.clear()
+
             compilation_thread = threading.Thread(target=self.compile_clip,
-                                                  args=(frames_to_compile,),
+                                                  args=(frames_to_compile,actual_duration,clip_audio),
                                                   daemon = True)
             compilation_thread.start()
 
@@ -90,52 +233,60 @@ class MainProgram(customtkinter.CTk):
         elif not keyboard.is_pressed(self.button_callback.clipping_key):
             self.clip_key_pressed = False
 
-        self.capture_screen()
-        self.after(1,self.loop) # Lets the program logic mainloop keep running alongside GUI
+        # ~66Hz key polling is plenty responsive and costs the GUI almost nothing
+        self.after(15,self.loop)
 
-    # Writes whatever the input is to wherever it needs to go
-    def capture_screen(self):
-
-        current_time = time.time()
-
-        # Defines the monitor
-        self.monitor = self.sct.monitors[self.button_callback.monitor + 1]
-
-        # Calculates frame delay to hit target fps
-        elapsed_time = current_time - self.last_frame_time
-        frame_delay = 1.0 / self.button_callback.fps
-
-        if elapsed_time >= frame_delay:
-            # Gets a screenshot and adds it to the list
-            try:
-                sct_image= self.sct.grab(self.monitor)
-                self.video_list.append(sct_image.bgra)
-            except:
-                pass
-
-            # Culls unneeded screenshots
-            if len(self.video_list) > self.button_callback.fps * self.button_callback.clip_length:
-                self.video_list.pop(0)
-
-            self.last_frame_time += frame_delay
 
 # Puts all the screenshots together into a video
-    def compile_clip(self,video_list):
+    def compile_clip(self,video_list, actual_duration, audio=None):
         width = self.monitor['width']
         height = self.monitor['height']
+
+        if not video_list:
+            print("No frames to compile!")
+            return
+
+        total_frames = len(video_list)
+        actual_fps = total_frames / float(actual_duration) if actual_duration > 0 else 60.0
+        print('Total Frames: ',total_frames)
+        print('Actual FPS: ', actual_fps)
+
+        # Write the captured audio to a temp WAV so ffmpeg can mux it in
+        audio_path = None
+        if audio is not None and len(audio):
+            try:
+                audio_path = os.path.join(tempfile.gettempdir(),
+                                          f"clip_audio_{time.time()}.wav")
+                write_wav(audio_path, audio, SAMPLE_RATE)
+            except Exception as ae:
+                print(f"Audio write error: {ae}")
+                audio_path = None
+
         ffmpeg_cmd = [
-            'bin/ffmpeg.exe',
+            FFMPEG_PATH,
             '-y',  # Overwrite output file if it already exists
-            '-f', 'rawvideo',  # Input format is raw pixels
-            '-vcodec', 'rawvideo',
+            '-f', 'image2pipe',  # Input format is raw pixels
+            '-vcodec', 'mjpeg',
             '-pix_fmt', 'bgr0',  # MSS bgra data maps perfectly to FFmpeg's bgr0
             '-s', f"{width}x{height}",  # Tell FFmpeg the dimensions of the incoming frames
-            '-r', str(self.button_callback.fps),  # Input frame rate
+            '-r', str(actual_fps),  # Input frame rate
             '-i', '-',  # '-' tells FFmpeg to listen to the incoming RAM pipe
-            '-c:v', 'libx264',  # Encode using the standard H.264 video codec
-            '-pix_fmt', 'yuv420p',  # Ensure maximum compatibility for media players
-            self.button_callback.create_file_name()
         ]
+
+        # Second input: the captured audio track
+        if audio_path:
+            ffmpeg_cmd += ['-i', audio_path]
+
+        ffmpeg_cmd += [
+            *GPU_CODEC_FLAGS,
+            '-pix_fmt', 'yuv420p',  # Ensure maximum compatibility for media players
+        ]
+
+        # Encode the audio and stop at whichever stream ends first
+        if audio_path:
+            ffmpeg_cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
+
+        ffmpeg_cmd += [SAVE_LOCATION + str(self.button_callback.create_file_name())]
 
         process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
@@ -145,6 +296,13 @@ class MainProgram(customtkinter.CTk):
 
         process.stdin.close()
         process.wait()
+
+        # Clean up the temp audio file
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
         print('Clipped!')
 
 
@@ -173,7 +331,26 @@ class MainProgram(customtkinter.CTk):
             for line in reader:
                 if line[0] == pointer:
                     return line[1]
+            print('Unreadable Value!')
             return None
+    # Microphone logic ------------------------------------------------------------------------
+    # returns all the available microphone
+    def get_all_mics(self):
+        # This filters for inputs AND ensures it only grabs modern WASAPI devices
+        wasapi_mics = [
+            d['name'] for d in sd.query_devices()
+            if d['max_input_channels'] > 0 and sd.query_hostapis(d['hostapi'])['name'] == 'Windows WASAPI'
+        ]
+        return wasapi_mics
+
+    def get_all_internal_mics(self):
+        # This filters for inputs AND ensures it only grabs modern WASAPI devices
+        wasapi_mics = [
+            d['name'] for d in sd.query_devices()
+            if d['max_input_channels'] == 0 and sd.query_hostapis(d['hostapi'])['name'] == 'Windows WASAPI'
+        ]
+        return wasapi_mics
+
 
     # Tray Logic ------------------------------------------------------------------------
 

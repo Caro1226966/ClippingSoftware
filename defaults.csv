@@ -1,5 +1,9 @@
 clip_key,f8
-clip_length,10
+clip_length,60
 monitor,0
-fps, 60
-ffmpeg_loc,
+fps,60
+mic,SteelSeries Sonar - Microphone (SteelSeries Sonar Virtual Audio Device)
+mic_enabled,1
+internal_mic,Headphones (6- High Definition Audio Device)
+internal_mic_enabled,1
+mouse_enabled,1
