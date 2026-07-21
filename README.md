@@ -89,6 +89,9 @@ Captured frames are timestamped and re-timed to a constant frame rate when a cli
 is written, so clips play at real speed even if the capture rate dipped, with the
 audio taken from the same wall-clock window to stay in sync.
 
+## Credit
+This program was made by Caro122 and Claude. I do not take credit for anything made by claude.
+
 ## Licence
 
 MIT — see [`LICENSE`](LICENSE).
