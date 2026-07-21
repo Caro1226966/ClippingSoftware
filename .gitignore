@@ -11,3 +11,6 @@ dist/
 
 # IDE
 .idea/
+
+# Old PyQt prototype, superseded by clip_browser.py
+tests.py
