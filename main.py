@@ -13,6 +13,7 @@ if IS_FROZEN:
         pass
 
 _instance_mutex = None
+SHOW_EVENT_NAME = 'Caro122ClippingSoftwareShow'
 
 
 def already_running():
@@ -25,6 +26,26 @@ def already_running():
         return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return False
+
+
+def create_show_event():
+    """Auto-reset event the running copy watches so clicking the desktop /
+    Start Menu shortcut opens the window instead of doing nothing."""
+    try:
+        return ctypes.windll.kernel32.CreateEventW(None, False, False, SHOW_EVENT_NAME)
+    except Exception:
+        return None
+
+
+def signal_existing_instance():
+    """Ask the copy that's already running to bring its window up."""
+    try:
+        handle = ctypes.windll.kernel32.OpenEventW(0x0002, False, SHOW_EVENT_NAME)
+        if handle:
+            ctypes.windll.kernel32.SetEvent(handle)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
 
 
 def _make_clips_icon():
@@ -47,6 +68,7 @@ class MainProgram(customtkinter.CTk):
         # App logic flags
         self.clip_key_pressed = False
         self.popup_active = False
+        self._show_event = create_show_event()
 
         # Monitor settings
         self.monitor_list = []
@@ -265,6 +287,11 @@ class MainProgram(customtkinter.CTk):
     # screen grabbing/encoding runs on the ScreenCapture thread, so the GUI
     # never blocks and the clip key stays responsive.
     def loop(self):
+        # Someone launched a second copy (desktop/Start Menu shortcut) — it asks
+        # us to show the window rather than starting a rival instance
+        if self._show_event and ctypes.windll.kernel32.WaitForSingleObject(self._show_event, 0) == 0:
+            self.show_window()
+
         if keyboard.is_pressed(self.button_callback.clipping_key) and self.clip_key_pressed == False:
             print('Clipping...')
             popup = Popup()
@@ -425,6 +452,7 @@ class MainProgram(customtkinter.CTk):
     def show_window(self):
         self.deiconify()
         self.lift()
+        self.focus_force()
 
     # Hides the window
     def hide_window(self):
@@ -482,6 +510,7 @@ class Popup(customtkinter.CTkToplevel):
 
 if __name__ == "__main__":
     if already_running():
-        print('Another instance is already running — exiting.')
+        # Don't start a rival copy — just surface the one that's already there
+        signal_existing_instance()
         sys.exit(0)
     program = MainProgram()
