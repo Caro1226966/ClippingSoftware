@@ -1,5 +1,40 @@
 from config import *
 from button_callbacks import *
+from clip_browser import ClipBrowser
+
+# The packaged .exe is windowed, so it has no console to print to. Send output
+# to a log file instead: printing to a missing stdout would otherwise crash it,
+# and this gives users something to look at when something goes wrong.
+if IS_FROZEN:
+    try:
+        sys.stdout = sys.stderr = open(LOG_PATH, 'a', buffering=1,
+                                       encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+_instance_mutex = None
+
+
+def already_running():
+    """True if another copy is already running (it lives in Startup, so a
+    double-launch would otherwise fight over the hotkey and audio devices)."""
+    global _instance_mutex
+    try:
+        _instance_mutex = ctypes.windll.kernel32.CreateMutexW(None, False,
+                                                              'Caro122ClippingSoftware')
+        return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+def _make_clips_icon():
+    """Draws a little video-camera icon for the clip browser button."""
+    img = Image.new('RGBA', (44, 32), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 4, 28, 27], radius=6, fill='#dce4ee')
+    d.polygon([(31, 12), (43, 5), (43, 26), (31, 19)], fill='#dce4ee')
+    d.polygon([(11, 11), (11, 21), (20, 16)], fill='#1f538d')
+    return img
 
 
 class MainProgram(customtkinter.CTk):
@@ -34,6 +69,10 @@ class MainProgram(customtkinter.CTk):
 
         # Threaded screen capture (keeps the grab/encode off the GUI thread)
         self.screen = ScreenCapture(self)
+
+        # The clip browser window (opened from the little video icon).
+        # The button itself is created last so it stacks above everything else.
+        self.clip_browser = None
 
         # The colloum that all the UI emelents sit in
         self.left_column = customtkinter.CTkFrame(self, fg_color="transparent")
@@ -193,6 +232,16 @@ class MainProgram(customtkinter.CTk):
         else:
             self.mouse_tick_box.deselect()
 
+        # Clip-browser button — created last and lifted so it always sits on top
+        # of the other widgets, tucked into the top-right corner clear of the row
+        self._clips_icon = customtkinter.CTkImage(light_image=_make_clips_icon(),
+                                                  dark_image=_make_clips_icon(), size=(22, 16))
+        self.clips_button = customtkinter.CTkButton(self, width=44, height=34, text='',
+                                                    image=self._clips_icon,
+                                                    command=self.open_clip_browser)
+        self.clips_button.place(relx=1.0, rely=0.0, x=-14, y=14, anchor='ne')
+        self.clips_button.lift()
+
         # Close to system tray
         self.system_tray_setup()
         self.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -200,6 +249,12 @@ class MainProgram(customtkinter.CTk):
         # Starts the audio + screen recording
         self.audio.start()
         self.screen.start()
+
+        # Built to sit in Startup: stay out of the way and run from the tray.
+        # The window is only shown on the very first launch (so a new user can
+        # set it up) or when '--show' is passed.
+        if not (FIRST_RUN or '--show' in sys.argv):
+            self.hide_window()
 
         self.loop() # The program logic
 
@@ -215,16 +270,17 @@ class MainProgram(customtkinter.CTk):
             popup = Popup()
 
             # Grab the buffered frames (this also clears the rolling buffer)
-            frames_to_compile, actual_duration = self.screen.snapshot()
-            if frames_to_compile:
-                # Snapshot the matching audio window before it is cleared
-                clip_audio = self.audio.get_clip_audio(actual_duration)
+            items, t_first, t_last = self.screen.snapshot()
+            if items:
+                # Grab the audio for exactly the same wall-clock window so the
+                # two stay locked together
+                clip_audio = self.audio.get_clip_audio(t_first, t_last)
             else:
                 clip_audio = None
             self.audio.clear()
 
             compilation_thread = threading.Thread(target=self.compile_clip,
-                                                  args=(frames_to_compile,actual_duration,clip_audio),
+                                                  args=(items, t_first, t_last, clip_audio),
                                                   daemon = True)
             compilation_thread.start()
 
@@ -238,17 +294,19 @@ class MainProgram(customtkinter.CTk):
 
 
 # Puts all the screenshots together into a video
-    def compile_clip(self,video_list, actual_duration, audio=None):
+    def compile_clip(self, items, t_first, t_last, audio=None):
         width = self.monitor['width']
         height = self.monitor['height']
 
-        if not video_list:
+        if not items:
             print("No frames to compile!")
             return
 
-        total_frames = len(video_list)
-        actual_fps = total_frames / float(actual_duration) if actual_duration > 0 else 60.0
-        print('Total Frames: ',total_frames)
+        # Re-time the captured frames to a constant fps so playback matches
+        # real time even when the capture rate dipped under load
+        video_list, actual_fps = build_cfr_frames(items, t_first, t_last)
+        print('Captured Frames: ', len(items))
+        print('Output Frames: ', len(video_list))
         print('Actual FPS: ', actual_fps)
 
         # Write the captured audio to a temp WAV so ffmpeg can mux it in
@@ -309,7 +367,7 @@ class MainProgram(customtkinter.CTk):
     def write_to_file(self,pointer, value):
         # print('Called Write to file')
         updated_file = []
-        with open('defaults.csv', 'r') as csvfile:
+        with open(CONFIG_PATH, 'r') as csvfile:
             reader = csv.reader(csvfile)
 
             for line in reader:
@@ -320,12 +378,12 @@ class MainProgram(customtkinter.CTk):
                 updated_file.append(line) # adds the line as a new component in the list
 
         # re-writes the file to put in the new values accurately
-        with open('defaults.csv','w',newline='') as csvfile:
+        with open(CONFIG_PATH,'w',newline='') as csvfile:
             csvwriter = csv.writer(csvfile)
             csvwriter.writerows(updated_file)
 
     def read_from_file(self, pointer):
-        with open('defaults.csv','r') as csvfile:
+        with open(CONFIG_PATH,'r') as csvfile:
             reader = csv.reader(csvfile)
 
             for line in reader:
@@ -351,6 +409,15 @@ class MainProgram(customtkinter.CTk):
         ]
         return wasapi_mics
 
+
+    # Clip browser ------------------------------------------------------------------------
+    def open_clip_browser(self):
+        if self.clip_browser is not None and self.clip_browser.winfo_exists():
+            self.clip_browser.deiconify()
+            self.clip_browser.lift()
+            self.clip_browser.focus()
+        else:
+            self.clip_browser = ClipBrowser(self)
 
     # Tray Logic ------------------------------------------------------------------------
 
@@ -414,4 +481,7 @@ class Popup(customtkinter.CTkToplevel):
 
 
 if __name__ == "__main__":
+    if already_running():
+        print('Another instance is already running — exiting.')
+        sys.exit(0)
     program = MainProgram()

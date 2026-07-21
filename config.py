@@ -1,11 +1,17 @@
 import os
+import sys
+import shutil
 import keyboard
 import customtkinter
 import numpy
 import tkinter as tk
 import sounddevice as sd
 import soundcard as sc
-import ffmpeg
+from soundcard import SoundcardRuntimeWarning
+import warnings
+# "data discontinuity in recording" fires whenever WASAPI loopback resumes after
+# silence — it's expected and harmless, so keep it out of the console.
+warnings.filterwarnings('ignore', category=SoundcardRuntimeWarning)
 from PIL import Image, ImageDraw
 import pystray
 import threading
@@ -20,6 +26,32 @@ import wave
 import tempfile
 import ctypes
 from collections import deque
+
+# ── Paths (work both from source and from the packaged .exe) ────────────────
+IS_FROZEN = getattr(sys, 'frozen', False)
+
+
+def resource_path(*parts):
+    """Path to a file bundled with the app (PyInstaller unpacks to _MEIPASS)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
+
+
+# Settings must live somewhere writable — the exe's own folder may be read-only
+# and a startup-launched app runs with its working directory set to System32.
+APP_DIR = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'),
+                       'ClippingSoftware')
+os.makedirs(APP_DIR, exist_ok=True)
+CONFIG_PATH = os.path.join(APP_DIR, 'defaults.csv')
+LOG_PATH = os.path.join(APP_DIR, 'log.txt')
+
+# First launch on this machine: seed the settings file from the bundled defaults
+FIRST_RUN = not os.path.exists(CONFIG_PATH)
+if FIRST_RUN:
+    try:
+        shutil.copyfile(resource_path('defaults.csv'), CONFIG_PATH)
+    except Exception as e:
+        print(f'Could not create settings file: {e}')
 
 root = tk.Tk()
 SCREEN_WIDTH = root.winfo_screenwidth()
@@ -73,7 +105,7 @@ def get_gpu():
 GPU_CODEC_FLAGS = get_gpu()
 
 # Absolute path to the bundled ffmpeg so it resolves no matter the launch directory
-FFMPEG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'ffmpeg.exe')
+FFMPEG_PATH = resource_path('bin', 'ffmpeg.exe')
 
 
 # Handles the location to save the clip (always in the user's pictures directory and in a folder called clipping)
@@ -95,6 +127,13 @@ SAMPLE_RATE = 44100
 AUDIO_CHANNELS = 2
 # How many frames to pull per record() call (~46ms chunks)
 AUDIO_CHUNK = 2048
+# WASAPI capture buffer (~100ms) — bigger buffer tolerates the audio thread
+# briefly stalling under load without dropping samples
+AUDIO_BUFFER_BLOCK = SAMPLE_RATE // 10
+
+# Hard cap on the video ring buffer so a long clip length can't eat all the RAM.
+# Frames past this budget are dropped oldest-first (the clip just gets shorter).
+MAX_BUFFER_BYTES = 700 * 1024 * 1024
 
 
 def write_wav(path, data, samplerate=SAMPLE_RATE):
@@ -133,7 +172,15 @@ class AudioSource(threading.Thread):
         for m in mics:
             if self.device_name and self.device_name in m.name and m.isloopback == self.loopback:
                 return m
-        return None
+        # Saved device isn't on this machine (fresh install on someone else's PC)
+        # — use whatever Windows has set as the default so audio works out of the box
+        try:
+            if self.loopback:
+                return sc.get_microphone(str(sc.default_speaker().name), include_loopback=True)
+            return sc.default_microphone()
+        except Exception:
+            print(f'Audio source not found: {self.device_name!r} (loopback={self.loopback})')
+            return None
 
     def run(self):
         # soundcard's WASAPI/MediaFoundation backend needs COM initialised per thread
@@ -144,12 +191,14 @@ class AudioSource(threading.Thread):
         try:
             mic = self._resolve()
             if mic is None:
-                print(f"Audio source not found: {self.device_name!r} (loopback={self.loopback})")
                 return
             self._running = True
-            with mic.recorder(samplerate=SAMPLE_RATE, channels=AUDIO_CHANNELS) as rec:
+            with mic.recorder(samplerate=SAMPLE_RATE, channels=AUDIO_CHANNELS,
+                              blocksize=AUDIO_BUFFER_BLOCK) as rec:
                 while self._running:
                     data = rec.record(numframes=AUDIO_CHUNK)
+                    # Timestamp is the moment this chunk finished recording, so
+                    # the chunk covers [ts - len/sr, ts] on the wall clock
                     ts = time.time()
                     with self.lock:
                         self.buffer.append((ts, data))
@@ -166,13 +215,29 @@ class AudioSource(threading.Thread):
             except Exception:
                 pass
 
-    def get_last_n_seconds(self, n):
-        cutoff = time.time() - n
+    def get_window(self, t_start, t_end):
+        """Returns smooth audio of exactly (t_end - t_start) seconds for the clip.
+
+        Consecutive recorded chunks are contiguous samples, so we simply
+        concatenate them (click-free) and keep the most recent `target` samples
+        — this lines the audio's end up with the end of the clip. Placing chunks
+        individually by timestamp would introduce a tiny gap/overlap at every
+        chunk boundary, which is exactly what makes the audio crackle."""
+        target = int(round((t_end - t_start) * SAMPLE_RATE))
+        if target <= 0:
+            return None
         with self.lock:
-            chunks = [d for ts, d in self.buffer if ts >= cutoff]
+            chunks = [d for _, d in self.buffer]
         if not chunks:
             return None
-        return numpy.concatenate(chunks, axis=0)
+        audio = numpy.concatenate(chunks, axis=0)
+        if audio.ndim == 1:
+            audio = audio.reshape(-1, AUDIO_CHANNELS)
+        if len(audio) >= target:
+            return audio[-target:].copy()
+        # Audio started a touch late — pad the beginning so the end still aligns
+        pad = numpy.zeros((target - len(audio), AUDIO_CHANNELS), dtype=numpy.float32)
+        return numpy.concatenate([pad, audio], axis=0)
 
     def clear(self):
         with self.lock:
@@ -235,11 +300,12 @@ class AudioManager:
             s.join(timeout=0.5)
         self.sources = []
 
-    def get_clip_audio(self, seconds):
-        """Returns the last `seconds` of mixed audio (float32 stereo) or None."""
+    def get_clip_audio(self, t_start, t_end):
+        """Returns the mixed audio (float32 stereo) for the wall-clock window
+        [t_start, t_end], aligned to the video timeline, or None."""
         arrays = []
         for s in self.sources:
-            a = s.get_last_n_seconds(seconds)
+            a = s.get_window(t_start, t_end)
             if a is not None and len(a):
                 arrays.append(a)
         if not arrays:
@@ -247,9 +313,9 @@ class AudioManager:
         if len(arrays) == 1:
             return arrays[0]
 
-        # Align to the shortest source (take the most-recent samples of each) and sum
+        # Every source window is the same length, so they line up sample-for-sample
         n = min(len(a) for a in arrays)
-        mixed = numpy.sum([a[-n:] for a in arrays], axis=0)
+        mixed = numpy.sum([a[:n] for a in arrays], axis=0)
 
         # Soft protection against clipping when several loud sources overlap
         peak = numpy.abs(mixed).max()
@@ -293,11 +359,27 @@ def draw_cursor(frame, monitor):
     cv2.polylines(frame, [pts], True, (0, 0, 0, 255), 1, cv2.LINE_AA)
 
 
+def _monitor_hmon(mon):
+    """HMONITOR handle for an mss monitor dict (its centre point)."""
+    class _POINT(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+    cx = mon['left'] + mon['width'] // 2
+    cy = mon['top'] + mon['height'] // 2
+    return ctypes.windll.user32.MonitorFromPoint(_POINT(cx, cy), 2)  # NEAREST
+
+
 class ScreenCapture(threading.Thread):
     """Grabs frames on a background thread into a rolling JPEG ring buffer.
 
-    Moving the grab + encode off the Tkinter main thread keeps the GUI
-    responsive; the main thread only reads settings and snapshots the buffer."""
+    Prefers the GPU-based Desktop Duplication API (dxcam) — it reads a frame in
+    ~1ms vs ~17ms for GDI BitBlt, and only delivers a frame when the screen
+    actually changes, so an idle screen costs almost nothing. Falls back to mss
+    (BitBlt) if dxcam is unavailable or fails, so capture always works.
+
+    Either way the grab + encode stays off the Tkinter thread; the GUI only
+    reads settings and snapshots the buffer."""
+
+    HEARTBEAT = 0.5  # during a static screen, restamp the last frame this often
 
     def __init__(self, main):
         super().__init__(daemon=True)
@@ -305,83 +387,256 @@ class ScreenCapture(threading.Thread):
         self.frames = deque()
         self.lock = threading.Lock()
         self._running = False
+        self._bytes = 0
         self.monitor = None
         self.width = 0
         self.height = 0
+        self.backend = None
+
+    # Frame storage (shared by both backends) --------------------------------
+    def _append(self, ts, jpeg, clip_length):
+        with self.lock:
+            self.frames.append((ts, jpeg))
+            self._bytes += len(jpeg)
+            cutoff = ts - clip_length
+            # Drop frames older than the clip length, or over the memory budget
+            while self.frames and (self.frames[0][0] < cutoff or self._bytes > MAX_BUFFER_BYTES):
+                _, old = self.frames.popleft()
+                self._bytes -= len(old)
+
+    def _set_monitor(self, mon):
+        self.monitor = mon
+        self.width = mon['width']
+        self.height = mon['height']
+        self.main.monitor = mon  # compile_clip reads dimensions from here
+
+    def _resolve_monitor(self, monitors, bc):
+        try:
+            return monitors[bc.monitor + 1]
+        except Exception:
+            return monitors[1] if len(monitors) > 1 else monitors[0]
 
     def run(self):
         self._running = True
+        # Try the fast GPU path first; on any problem, fall back to BitBlt
+        try:
+            if self._run_dxcam():
+                return
+        except Exception as e:
+            print(f'dxcam unavailable, using mss fallback: {e}')
+        self._run_mss()
+
+    # Fast path: Desktop Duplication via dxcam -------------------------------
+    def _run_dxcam(self):
+        import dxcam  # optional dependency; ImportError -> mss fallback
+
+        # Map each dxcam output to its HMONITOR so we can follow the UI's
+        # monitor selection regardless of GPU/output ordering. getattr avoids
+        # Python name-mangling of the module's dunder `__factory` inside a class.
+        factory = getattr(dxcam, '__factory')
+        out_by_hmon = {}
+        for di, dev in enumerate(factory.outputs):
+            for oi, o in enumerate(dev):
+                out_by_hmon[getattr(o, 'hmonitor', None)] = (di, oi)
+
+        with mss.MSS() as probe:
+            monitors = probe.monitors
+
+        cam = None
+        cur_key = None
+        last_jpeg = None
+        last_raw = None
+        last_cursor = None
+        last_store = 0.0
+        next_frame = time.time()
+        grab_errors = 0
+
+        try:
+            while self._running:
+                bc = self.main.button_callback
+                try:
+                    fps = max(int(bc.fps), 1)
+                except (TypeError, ValueError):
+                    fps = 60
+                frame_interval = 1.0 / fps
+                try:
+                    clip_length = float(bc.clip_length)
+                except (TypeError, ValueError):
+                    clip_length = 60.0
+
+                mon = self._resolve_monitor(monitors, bc)
+                key = out_by_hmon.get(_monitor_hmon(mon))
+                if key is None:
+                    return False  # can't map this monitor -> let mss handle it
+                if key != cur_key:
+                    self._release(cam)
+                    cam = dxcam.create(device_idx=key[0], output_idx=key[1], output_color='BGR')
+                    if cam is None:
+                        return False
+                    cur_key = key
+                    self.backend = 'dxcam'
+                    self._set_monitor(mon)
+                    last_jpeg = last_raw = None
+
+                now = time.time()
+                if now < next_frame:
+                    time.sleep(min(next_frame - now, 0.004))
+                    continue
+
+                try:
+                    frame = cam.grab()  # BGR ndarray, or None when nothing changed
+                    grab_errors = 0
+                except Exception as e:
+                    grab_errors += 1
+                    if grab_errors >= 10:
+                        print(f'dxcam grab failing, switching to mss: {e}')
+                        return False
+                    frame = None
+
+                now = time.time()
+                mouse = getattr(bc, 'mouse_enabled', 0)
+                to_encode = None
+
+                if frame is not None:
+                    last_raw = frame
+                    if mouse:
+                        f = frame.copy()           # don't scribble on dxcam's buffer
+                        draw_cursor(f, mon)
+                        last_cursor = _cursor_pos()
+                        to_encode = f
+                    else:
+                        to_encode = frame
+                elif mouse and last_raw is not None and _cursor_pos() != last_cursor:
+                    # Screen static but the cursor moved — refresh it on the last frame
+                    f = last_raw.copy()
+                    draw_cursor(f, mon)
+                    last_cursor = _cursor_pos()
+                    to_encode = f
+
+                if to_encode is not None:
+                    ok, buf = cv2.imencode('.jpg', to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    if ok:
+                        last_jpeg = buf.tobytes()
+                        self._append(now, last_jpeg, clip_length)
+                        last_store = now
+                elif last_jpeg is not None and now - last_store >= self.HEARTBEAT:
+                    # Keep the timeline current cheaply — reuse the same bytes
+                    self._append(now, last_jpeg, clip_length)
+                    last_store = now
+
+                next_frame += frame_interval
+                if now - next_frame > frame_interval * 3:
+                    next_frame = time.time() + frame_interval
+
+            return True
+        finally:
+            self._release(cam)
+
+    @staticmethod
+    def _release(cam):
+        if cam is not None:
+            try:
+                cam.release()
+            except Exception:
+                pass
+
+    # Fallback path: GDI BitBlt via mss --------------------------------------
+    def _run_mss(self):
+        self.backend = 'mss'
         try:
             sct = mss.MSS()
         except Exception as e:
             print(f'Screen capture init error: {e}')
             return
-        monitors = sct.monitors
-        next_frame = time.time()
+        # `with` releases the GDI device contexts/bitmaps when the thread stops
+        with sct:
+            monitors = sct.monitors
+            next_frame = time.time()
+            grab_errors = 0
 
-        while self._running:
-            bc = self.main.button_callback
-            try:
-                fps = max(int(bc.fps), 1)
-            except (TypeError, ValueError):
-                fps = 60
-            frame_interval = 1.0 / fps
-            try:
-                clip_length = float(bc.clip_length)
-            except (TypeError, ValueError):
-                clip_length = 60.0
+            while self._running:
+                bc = self.main.button_callback
+                try:
+                    fps = max(int(bc.fps), 1)
+                except (TypeError, ValueError):
+                    fps = 60
+                frame_interval = 1.0 / fps
+                try:
+                    clip_length = float(bc.clip_length)
+                except (TypeError, ValueError):
+                    clip_length = 60.0
 
-            now = time.time()
-            if now < next_frame:
-                # Sleep in small slices so fps/monitor changes are picked up quickly
-                time.sleep(min(next_frame - now, 0.004))
-                continue
+                now = time.time()
+                if now < next_frame:
+                    time.sleep(min(next_frame - now, 0.004))
+                    continue
 
-            # Resolve the monitor to capture (UI index is 0-based)
-            try:
-                monitor = monitors[bc.monitor + 1]
-            except Exception:
-                monitor = monitors[1] if len(monitors) > 1 else monitors[0]
-            self.monitor = monitor
-            self.width = monitor['width']
-            self.height = monitor['height']
-            self.main.monitor = monitor  # compile_clip reads dimensions from here
+                mon = self._resolve_monitor(monitors, bc)
+                self._set_monitor(mon)
 
-            try:
-                img = sct.grab(monitor)
-                frame = numpy.array(img)  # BGRA, writable copy
-                if getattr(bc, 'mouse_enabled', 0):
-                    draw_cursor(frame, monitor)
-                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-                if ok:
-                    ts = time.time()
-                    with self.lock:
-                        self.frames.append((ts, buf.tobytes()))
-                        # Cull frames older than the clip length (O(1) from the left)
-                        cutoff = ts - clip_length
-                        while self.frames and self.frames[0][0] < cutoff:
-                            self.frames.popleft()
-            except Exception:
-                print('Grab Monitor Error!!!')
+                try:
+                    frame = numpy.array(sct.grab(mon))  # BGRA
+                    if getattr(bc, 'mouse_enabled', 0):
+                        draw_cursor(frame, mon)
+                    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    if ok:
+                        self._append(time.time(), buf.tobytes(), clip_length)
+                    grab_errors = 0
+                except Exception as e:
+                    grab_errors += 1
+                    if grab_errors == 1 or grab_errors % 120 == 0:
+                        print(f'Grab Monitor Error ({grab_errors}): {e}')
 
-            next_frame += frame_interval
-            # Drift correction if we fell far behind (heavy load / slow monitor)
-            if now - next_frame > frame_interval * 3:
-                next_frame = time.time() + frame_interval
+                next_frame += frame_interval
+                if now - next_frame > frame_interval * 3:
+                    next_frame = time.time() + frame_interval
 
     def snapshot(self):
-        """Returns (ordered_jpeg_frames, duration_seconds) and clears the buffer."""
+        """Returns (timestamped_frames, t_first, t_last) and clears the buffer.
+        Frames keep their timestamps so the clip can be re-timed to constant fps."""
         with self.lock:
             items = list(self.frames)
             self.frames.clear()
+            self._bytes = 0
         if not items:
-            return [], 0.0
-        duration = items[-1][0] - items[0][0]
-        return [f for ts, f in items], duration
+            return [], 0.0, 0.0
+        return items, items[0][0], items[-1][0]
 
     def clear(self):
         with self.lock:
             self.frames.clear()
+            self._bytes = 0
 
     def stop(self):
         self._running = False
+
+
+def build_cfr_frames(items, t_first, t_last):
+    """Re-times variably-spaced captured frames to a constant frame rate.
+
+    Screen-capture rate dips under load, so encoding the raw frames at one
+    average fps makes laggy stretches play too fast. Instead we lay down an
+    even output timeline and, for each tick, emit the frame that was actually
+    on screen at that moment — real time maps 1:1 to playback time.
+
+    Returns (ordered_jpeg_bytes, fps)."""
+    if not items:
+        return [], 30.0
+    duration = t_last - t_first
+    if duration <= 0:
+        return [f for _, f in items], 30.0
+
+    # Target the average capture rate: enough to show every frame, without
+    # inflating the file by duplicating frames to some higher nominal fps
+    fps = max(min(len(items) / duration, 120.0), 1.0)
+    n_out = max(int(round(duration * fps)), 1)
+
+    out = []
+    j = 0
+    for k in range(n_out):
+        tk = t_first + k / fps
+        # Advance to the most recent frame captured at or before this tick
+        while j + 1 < len(items) and items[j + 1][0] <= tk:
+            j += 1
+        out.append(items[j][1])
+    return out, fps
