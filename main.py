@@ -1,6 +1,8 @@
 from config import *
 from button_callbacks import *
 from clip_browser import ClipBrowser
+import queue
+import traceback
 
 # The packaged .exe is windowed, so it has no console to print to. Send output
 # to a log file instead: printing to a missing stdout would otherwise crash it,
@@ -69,6 +71,12 @@ class MainProgram(customtkinter.CTk):
         self.clip_key_pressed = False
         self.popup_active = False
         self._show_event = create_show_event()
+        # Work handed over from background threads (tray icon, etc.) to be run on
+        # the Tk main thread — touching widgets from another thread crashes Tcl
+        self._ui_queue = queue.Queue()
+        self._tray_icon = None
+        # Log Tk callback errors instead of letting them tear the program down
+        self.report_callback_exception = self._log_exception
 
         # Monitor settings
         self.monitor_list = []
@@ -287,41 +295,70 @@ class MainProgram(customtkinter.CTk):
     # screen grabbing/encoding runs on the ScreenCapture thread, so the GUI
     # never blocks and the clip key stays responsive.
     def loop(self):
+        # Run any work background threads (the tray icon) handed us
+        self._pump_ui_queue()
+
         # Someone launched a second copy (desktop/Start Menu shortcut) — it asks
         # us to show the window rather than starting a rival instance
         if self._show_event and ctypes.windll.kernel32.WaitForSingleObject(self._show_event, 0) == 0:
-            self.show_window()
+            self._do_show_window()
 
-        if keyboard.is_pressed(self.button_callback.clipping_key) and self.clip_key_pressed == False:
-            print('Clipping...')
-            popup = Popup()
-
-            # Grab the buffered frames (this also clears the rolling buffer)
-            items, t_first, t_last = self.screen.snapshot()
-            if items:
-                # Grab the audio for exactly the same wall-clock window so the
-                # two stay locked together
-                clip_audio = self.audio.get_clip_audio(t_first, t_last)
-            else:
-                clip_audio = None
-            self.audio.clear()
-
-            compilation_thread = threading.Thread(target=self.compile_clip,
-                                                  args=(items, t_first, t_last, clip_audio),
-                                                  daemon = True)
-            compilation_thread.start()
-
-            self.clip_key_pressed = True
-
-        elif not keyboard.is_pressed(self.button_callback.clipping_key):
-            self.clip_key_pressed = False
+        try:
+            if keyboard.is_pressed(self.button_callback.clipping_key) and self.clip_key_pressed == False:
+                self._start_clip()
+                self.clip_key_pressed = True
+            elif not keyboard.is_pressed(self.button_callback.clipping_key):
+                self.clip_key_pressed = False
+        except Exception:
+            traceback.print_exc()
 
         # ~66Hz key polling is plenty responsive and costs the GUI almost nothing
         self.after(15,self.loop)
 
+    def _start_clip(self):
+        print('Clipping...')
+        try:
+            Popup()
+        except Exception as e:
+            print(f'Popup error: {e}')  # a failed popup must not stop the clip
+
+        # Grab the buffered frames (this also clears the rolling buffer)
+        items, t_first, t_last = self.screen.snapshot()
+        if items:
+            # Grab the audio for exactly the same wall-clock window so the two
+            # stay locked together
+            clip_audio = self.audio.get_clip_audio(t_first, t_last)
+        else:
+            clip_audio = None
+        self.audio.clear()
+
+        threading.Thread(target=self.compile_clip,
+                         args=(items, t_first, t_last, clip_audio),
+                         daemon=True).start()
+
+    def _pump_ui_queue(self):
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                traceback.print_exc()
+
+    def _log_exception(self, exc, val, tb):
+        traceback.print_exception(exc, val, tb)
+
 
 # Puts all the screenshots together into a video
     def compile_clip(self, items, t_first, t_last, audio=None):
+        try:
+            self._compile_clip(items, t_first, t_last, audio)
+        except Exception:
+            traceback.print_exc()  # never let the encode thread die noisily
+
+    def _compile_clip(self, items, t_first, t_last, audio=None):
         width = self.monitor['width']
         height = self.monitor['height']
 
@@ -374,13 +411,20 @@ class MainProgram(customtkinter.CTk):
         ffmpeg_cmd += [SAVE_LOCATION + str(self.button_callback.create_file_name())]
 
         process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
+                                   stderr=subprocess.DEVNULL, creationflags=SUBPROCESS_FLAGS)
 
-        for image in video_list:
-            process.stdin.write(image)
-
-        process.stdin.close()
-        process.wait()
+        try:
+            for image in video_list:
+                process.stdin.write(image)
+            process.stdin.close()
+            process.wait()
+        except (BrokenPipeError, OSError) as e:
+            # ffmpeg died mid-encode — don't let it take the app down with it
+            print(f'Encode pipe error: {e}')
+            try:
+                process.kill()
+            except Exception:
+                pass
 
         # Clean up the temp audio file
         if audio_path:
@@ -447,20 +491,39 @@ class MainProgram(customtkinter.CTk):
             self.clip_browser = ClipBrowser(self)
 
     # Tray Logic ------------------------------------------------------------------------
+    # The tray menu callbacks fire on pystray's own thread, so they must NOT
+    # touch Tk directly — they hand the work to the main thread via the queue.
 
-    # Brings the window back up
-    def show_window(self):
+    # Brings the window back up (tray "Open")
+    def show_window(self, *args):
+        self._ui_queue.put(self._do_show_window)
+
+    def _do_show_window(self):
         self.deiconify()
         self.lift()
         self.focus_force()
 
-    # Hides the window
+    # Hides the window (called on the main thread: window close button / startup)
     def hide_window(self):
         self.withdraw()
 
-    # Shuts down the app
-    def quit_app(self,icon):
-        icon.stop()
+    # Shuts down the app (tray "Quit")
+    def quit_app(self, *args):
+        try:
+            if self._tray_icon is not None:
+                self._tray_icon.stop()
+        except Exception:
+            pass
+        self._ui_queue.put(self._do_quit)
+
+    def _do_quit(self):
+        try:
+            self.screen.stop()
+            self.audio.stop()
+        except Exception:
+            pass
+        # quit() unwinds mainloop cleanly; the daemon threads exit with the
+        # process. (destroy() here would error as the loop keeps ticking.)
         self.quit()
 
     # Initialises the system tray logic
@@ -468,11 +531,11 @@ class MainProgram(customtkinter.CTk):
         # Creates the menu and icon
         menu = pystray.Menu(pystray.MenuItem('Open',self.show_window),
                             pystray.MenuItem('Quit', self.quit_app))
-        tray_icon = pystray.Icon('Clipping Software',TRAY_ICON,
-                                 'Clipping Software', menu)
+        self._tray_icon = pystray.Icon('Clipping Software',TRAY_ICON,
+                                       'Clipping Software', menu)
 
         # Runs it in a thread so it doesn't stop the rest of the program
-        tray_thread = threading.Thread(target=tray_icon.run, daemon=True)
+        tray_thread = threading.Thread(target=self._tray_icon.run, daemon=True)
         tray_thread.start()
 
 

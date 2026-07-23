@@ -133,7 +133,7 @@ class ClipPlayer:
             r = subprocess.run(
                 [FFMPEG_PATH, '-v', 'error', '-i', self.path, '-vn',
                  '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '2', '-ar', str(self.sr), '-'],
-                capture_output=True)
+                capture_output=True, creationflags=SUBPROCESS_FLAGS)
             if r.stdout and len(r.stdout) >= 4:
                 self.audio = numpy.frombuffer(r.stdout, numpy.int16).reshape(-1, 2)
         except Exception as e:
@@ -786,7 +786,8 @@ class ClipBrowser(customtkinter.CTkToplevel):
 
     def _share_run_ffmpeg(self, cmd, duration, pass_idx):
         self._share_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                             stdin=subprocess.DEVNULL, text=True)
+                                             stdin=subprocess.DEVNULL, text=True,
+                                             creationflags=SUBPROCESS_FLAGS)
         for line in self._share_proc.stdout:
             if self._share_cancel.is_set():
                 self._share_proc.kill()

@@ -30,6 +30,11 @@ from collections import deque
 # ── Paths (work both from source and from the packaged .exe) ────────────────
 IS_FROZEN = getattr(sys, 'frozen', False)
 
+# Stop ffmpeg / PowerShell subprocesses from flashing up a console window when
+# the app runs as a windowed .exe. (Without this the window not only gets in the
+# way, but closing it kills the child process — truncating a clip mid-encode.)
+SUBPROCESS_FLAGS = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW
+
 
 def resource_path(*parts):
     """Path to a file bundled with the app (PyInstaller unpacks to _MEIPASS)."""
@@ -72,7 +77,8 @@ TRAY_ICON = create_icon_image() # Stores the icon image for if it is minimized t
 def get_gpu():
     try:
         cmd = 'PowerShell -Command "Get-CimInstance Win32_VideoController | Select-Object Name | ConvertTo-Json'
-        output = subprocess.check_output(cmd, shell=True, text=True).strip()
+        output = subprocess.check_output(cmd, shell=True, text=True,
+                                         creationflags=SUBPROCESS_FLAGS).strip()
         gpu_name_lower = output.lower()
 
         print('GPU: ' + output)
