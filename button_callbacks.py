@@ -79,6 +79,17 @@ class Callbacks:
         self.main.screen.clear() # Makes sure it doesn't cock up the clip's speed
         self.main.audio.clear()
 
+# The method for the user to select the output resolution
+    def select_resolution(self, choice):
+        self.main.write_to_file(pointer='resolution', value=str(choice))
+
+# Volume sliders (0..1, applied to the captured audio when a clip is saved)
+    def set_mic_volume(self, value):
+        self.main.write_to_file(pointer='mic_volume', value=round(float(value), 3))
+
+    def set_internal_volume(self, value):
+        self.main.write_to_file(pointer='internal_volume', value=round(float(value), 3))
+
 # The method for the user to select the clip length
     def selectcliplength(self, choice):
         # Puts the correct value for the clip length

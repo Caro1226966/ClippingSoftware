@@ -63,7 +63,7 @@ def _make_clips_icon():
 class MainProgram(customtkinter.CTk):
     def __init__(self):
         super().__init__()
-        self.geometry(str(500)+'x'+ str(540))
+        self.geometry(str(520)+'x'+ str(640))
         self.resizable(False,False)
         self.title("Caro122's Clipping Software")
 
@@ -110,7 +110,7 @@ class MainProgram(customtkinter.CTk):
 
         # Row for active clipping button UI elements to sit in
         self.keybind_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.keybind_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.keybind_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show what button is the active clipping button
         self.current_button_text = customtkinter.CTkTextbox(self.keybind_row,width=200, height=30)
@@ -124,7 +124,7 @@ class MainProgram(customtkinter.CTk):
 
         # Row for monitor selector UI elements to sit in
         self.monitor_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.monitor_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.monitor_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Monitor selector
         for monitor in range(len(self.sct.monitors)-1):
@@ -144,7 +144,7 @@ class MainProgram(customtkinter.CTk):
 
         # Row for monitor selector UI elements to sit in
         self.fps_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.fps_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.fps_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show user that dropdown selects the FPS
         self.current_monitor_text = customtkinter.CTkLabel(self.fps_row,width=200, height=30, text='FPS: ')
@@ -158,9 +158,24 @@ class MainProgram(customtkinter.CTk):
         self.fps_selector.set(self.read_from_file('fps'))
         self.fps_selector.pack(side = 'left', anchor='w',pady = 0, padx = 10)
 
+        # Row for resolution selector UI elements to sit in
+        self.resolution_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.resolution_row.pack(anchor="w", fill="x", pady=(0, 12))
+
+        self.current_resolution_text = customtkinter.CTkLabel(self.resolution_row, width=200, height=30, text='Resolution: ')
+        self.current_resolution_text.pack(side='left', anchor="w", padx=0, pady=0)
+        self.current_resolution_text.configure(state="disabled")
+
+        # Dropdown to select the output resolution
+        self.resolution_selector = customtkinter.CTkComboBox(self.resolution_row, values=RESOLUTION_OPTIONS,
+                                                             command=self.button_callback.select_resolution,
+                                                             state='readonly')
+        self.resolution_selector.set(self.read_from_file('resolution') or '1080p')
+        self.resolution_selector.pack(side='left', anchor='w', pady=0, padx=10)
+
         # Row for clip length UI elements to sit in
         self.length_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.length_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.length_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show user that dropdown selects the Clip Length
         self.current_length_text = customtkinter.CTkLabel(self.length_row, width=200, height=30, text='Clip Length: ')
@@ -177,7 +192,7 @@ class MainProgram(customtkinter.CTk):
 
         # Row for microphone UI elements to sit in
         self.mic_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.mic_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.mic_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show user that dropdown selects the Microphone
         self.current_mic_text = customtkinter.CTkLabel(self.mic_row, width=200, height=30, text='Microphone: ')
@@ -206,9 +221,20 @@ class MainProgram(customtkinter.CTk):
         else:
             self.mic_tick_box.deselect()
 
+        # Volume slider sitting under the microphone selector
+        self.mic_volume_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.mic_volume_row.pack(anchor="w", fill="x", pady=(0, 12))
+        self.mic_volume_text = customtkinter.CTkLabel(self.mic_volume_row, width=200, height=20, text='Mic Volume: ')
+        self.mic_volume_text.pack(side='left', anchor="w", padx=0, pady=0)
+        self.mic_volume_text.configure(state="disabled")
+        self.mic_volume_slider = customtkinter.CTkSlider(self.mic_volume_row, from_=0, to=1, width=200,
+                                                         command=self.button_callback.set_mic_volume)
+        self.mic_volume_slider.set(float(self.read_from_file('mic_volume') or 0.5))
+        self.mic_volume_slider.pack(side='left', anchor='w', pady=0, padx=10)
+
         # Row for internal microphone UI elements to sit in
         self.internal_audio_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.internal_audio_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.internal_audio_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show user that dropdown selects the Microphone
         self.internal_audio_text = customtkinter.CTkLabel(self.internal_audio_row, width=200, height=30, text='Computer Audio: ')
@@ -238,9 +264,20 @@ class MainProgram(customtkinter.CTk):
         else:
             self.internal_audio_tick_box.deselect()
 
+        # Volume slider sitting under the computer-audio selector
+        self.internal_volume_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.internal_volume_row.pack(anchor="w", fill="x", pady=(0, 12))
+        self.internal_volume_text = customtkinter.CTkLabel(self.internal_volume_row, width=200, height=20, text='Computer Volume: ')
+        self.internal_volume_text.pack(side='left', anchor="w", padx=0, pady=0)
+        self.internal_volume_text.configure(state="disabled")
+        self.internal_volume_slider = customtkinter.CTkSlider(self.internal_volume_row, from_=0, to=1, width=200,
+                                                              command=self.button_callback.set_internal_volume)
+        self.internal_volume_slider.set(float(self.read_from_file('internal_volume') or 0.5))
+        self.internal_volume_slider.pack(side='left', anchor='w', pady=0, padx=10)
+
         # Row for mouse capture UI elements to sit in
         self.mouse_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
-        self.mouse_row.pack(anchor="w", fill="x", pady=(0, 25))
+        self.mouse_row.pack(anchor="w", fill="x", pady=(0, 12))
 
         # Text to show user that the tickbox captures the mouse cursor
         self.mouse_text = customtkinter.CTkLabel(self.mouse_row, width=200, height=30, text='Capture Mouse: ')
@@ -398,6 +435,12 @@ class MainProgram(customtkinter.CTk):
         # Second input: the captured audio track
         if audio_path:
             ffmpeg_cmd += ['-i', audio_path]
+
+        # Scale the output to the chosen resolution (by height, keeping aspect).
+        # -2 keeps the width even, which the encoders require.
+        target_h = RESOLUTION_MAP.get(self.read_from_file('resolution'), height)
+        if target_h != height:
+            ffmpeg_cmd += ['-vf', f'scale=-2:{target_h}']
 
         ffmpeg_cmd += [
             *GPU_CODEC_FLAGS,

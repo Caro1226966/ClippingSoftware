@@ -2,8 +2,11 @@ clip_key,f8
 clip_length,60
 monitor,0
 fps,60
+resolution,1080p
 mic,Default
 mic_enabled,1
+mic_volume,0.5
 internal_mic,Default
 internal_mic_enabled,1
+internal_volume,0.5
 mouse_enabled,0

@@ -53,6 +53,32 @@ def sanitize_name(name):
     return name
 
 
+def build_edit_cmd(src, out, segments, has_audio):
+    """ffmpeg command that keeps only `segments` (list of (start, end) seconds)
+    and concatenates them — i.e. the trim range with the cut regions removed."""
+    n = len(segments)
+    parts = []
+    for i, (s, e) in enumerate(segments):
+        parts.append(f'[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]')
+        if has_audio:
+            parts.append(f'[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]')
+    if has_audio:
+        joined = ''.join(f'[v{i}][a{i}]' for i in range(n))
+        parts.append(f'{joined}concat=n={n}:v=1:a=1[outv][outa]')
+        maps = ['-map', '[outv]', '-map', '[outa]']
+    else:
+        joined = ''.join(f'[v{i}]' for i in range(n))
+        parts.append(f'{joined}concat=n={n}:v=1:a=0[outv]')
+        maps = ['-map', '[outv]']
+    cmd = [FFMPEG_PATH, '-y', '-v', 'error', '-i', src,
+           '-filter_complex', ';'.join(parts), *maps,
+           *GPU_CODEC_FLAGS, '-pix_fmt', 'yuv420p']
+    if has_audio:
+        cmd += ['-c:a', 'aac', '-b:a', '192k']
+    cmd += ['-movflags', '+faststart', out]
+    return cmd
+
+
 def get_clip_info(path, thumb_w, thumb_h):
     """Returns {'thumb': PIL image, 'duration': s, 'size': bytes} for a clip."""
     try:
@@ -235,7 +261,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
         super().__init__(master)
         self.title('Clips')
         self.geometry('960x640')
-        self.resizable(False, False)
+        self.minsize(760, 520)           # resizable, but keep the layout usable
         # Pop above the main window, then behave like a normal window
         self.attributes('-topmost', True)
         self.after(300, lambda: self.attributes('-topmost', False))
@@ -247,10 +273,21 @@ class ClipBrowser(customtkinter.CTkToplevel):
         self._suppress_slider = False
         self._load_token = 0
         self._pending_load = None        # result handed from the loader thread to _tick
+        self._pending_save = None        # result from the edit-save worker thread
         self._tile_imgs = []             # keep CTkImage refs alive
         self._frame_img = None
         self._known_files = []
         self._overlay = None
+        self._grid_cols = self.COLS      # recomputed as the window is resized
+        self._grid_resize_job = None
+
+        # Clip-editing state (trim + cuts), reset each time a clip is opened
+        self._edit_start = 0.0
+        self._edit_end = 0.0
+        self._cuts = []                  # list of [start, end] to remove
+        self._pending_cut = None         # start of an in-progress cut
+        self._drag_handle = None         # 'start' / 'end' while dragging a handle
+        self._saving_edit = False
 
         # Share/compress state (lives on the browser now that it's a page)
         self._share_src = None
@@ -273,8 +310,21 @@ class ClipBrowser(customtkinter.CTkToplevel):
         self._refresh_grid()
 
         self.bind('<FocusIn>', self._on_focus)
+        self.bind('<Configure>', self._on_window_resize)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.after(33, self._tick)
+
+    def _on_window_resize(self, event):
+        # Only react to the top-level window resizing, and debounce the grid
+        # reflow so we don't rebuild every tile on every pixel of a drag
+        if event.widget is not self or self._page != 'grid':
+            return
+        cols = max(1, min(6, (self.winfo_width() - 40) // (self.THUMB_W + 24)))
+        if cols == self._grid_cols:
+            return
+        if self._grid_resize_job is not None:
+            self.after_cancel(self._grid_resize_job)
+        self._grid_resize_job = self.after(120, self._refresh_grid)
 
     # Page plumbing ------------------------------------------------------------
     def _show_page(self, page):
@@ -327,6 +377,10 @@ class ClipBrowser(customtkinter.CTkToplevel):
             child.destroy()
         self._tile_imgs.clear()
 
+        # Fit as many tile columns as the current width allows (min 1)
+        avail = self._scroll.winfo_width() or (self.winfo_width() - 40)
+        self._grid_cols = max(1, min(6, avail // (self.THUMB_W + 24)))
+
         files = list_clips()
         self._known_files = files
         self._count_label.configure(text=f'{len(files)} clip{"s" if len(files) != 1 else ""}')
@@ -344,7 +398,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
         stem = os.path.splitext(os.path.basename(path))[0]
 
         tile = customtkinter.CTkFrame(self._scroll, corner_radius=10, fg_color='#2b2b2b')
-        tile.grid(row=i // self.COLS, column=i % self.COLS, padx=8, pady=8, sticky='n')
+        tile.grid(row=i // self._grid_cols, column=i % self._grid_cols, padx=8, pady=8, sticky='n')
 
         img = customtkinter.CTkImage(light_image=info['thumb'], dark_image=info['thumb'],
                                      size=(self.THUMB_W, self.THUMB_H))
@@ -475,7 +529,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
     # Viewer page ---------------------------------------------------------------
     def _build_viewer_page(self):
         header = customtkinter.CTkFrame(self._viewer_page, fg_color='transparent')
-        header.pack(fill='x', padx=16, pady=(10, 4))
+        header.pack(side='top', fill='x', padx=16, pady=(10, 4))
         customtkinter.CTkButton(header, text='←  Back', width=80,
                                 command=self._back_to_grid).pack(side='left')
         self._viewer_title = customtkinter.CTkLabel(header, text='',
@@ -490,21 +544,38 @@ class ClipBrowser(customtkinter.CTkToplevel):
         customtkinter.CTkButton(header, text='Share', width=72,
                                 command=self._viewer_share).pack(side='right', padx=6)
 
-        self._video_label = customtkinter.CTkLabel(self._viewer_page, text='', fg_color='#000000',
-                                                   width=self.VID_W, height=self.VID_H)
-        self._video_label.pack(padx=16, pady=4)
-        # One persistent CTkImage is reused for every frame. Creating a fresh
-        # CTkImage per frame churns Tk PhotoImages and can crash the redraw
-        # ("image doesn't exist"), so we only ever reconfigure this one. We use
-        # only light_image (CTkImage falls back to it in dark mode) so that
-        # resizing it never trips CTkImage's light/dark size-match check.
-        self._black_pil = Image.new('RGB', (self.VID_W, self.VID_H), '#000000')
-        self._frame_img = customtkinter.CTkImage(light_image=self._black_pil,
-                                                 size=(self.VID_W, self.VID_H))
-        self._video_label.configure(image=self._frame_img)
+        # ── Edit bar (bottom) ────────────────────────────────────────────────
+        edit_bar = customtkinter.CTkFrame(self._viewer_page, fg_color='transparent')
+        edit_bar.pack(side='bottom', fill='x', padx=16, pady=(2, 10))
+        customtkinter.CTkButton(edit_bar, text='⟤ Set start', width=88,
+                                command=self._set_edit_start).pack(side='left')
+        customtkinter.CTkButton(edit_bar, text='Set end ⟥', width=88,
+                                command=self._set_edit_end).pack(side='left', padx=6)
+        self._cut_btn = customtkinter.CTkButton(edit_bar, text='✂ Cut', width=90,
+                                                fg_color='#7a3b3b', hover_color='#8f4646',
+                                                command=self._toggle_cut)
+        self._cut_btn.pack(side='left', padx=(6, 0))
+        customtkinter.CTkButton(edit_bar, text='↺ Reset', width=76, fg_color='#3a3a3a',
+                                hover_color='#4a4a4a', command=self._reset_edits).pack(side='left', padx=6)
+        self._save_edit_btn = customtkinter.CTkButton(edit_bar, text='💾 Save edits', width=110,
+                                                      command=self._save_edits)
+        self._save_edit_btn.pack(side='right')
+        self._edit_info = customtkinter.CTkLabel(edit_bar, text='', text_color='#8a8a8a',
+                                                 font=customtkinter.CTkFont(size=11))
+        self._edit_info.pack(side='right', padx=10)
 
+        # ── Editing timeline (bottom, above the edit bar) ────────────────────
+        self._timeline = tk.Canvas(self._viewer_page, height=44, highlightthickness=0,
+                                   bg='#242424', cursor='sb_h_double_arrow')
+        self._timeline.pack(side='bottom', fill='x', padx=16, pady=(0, 2))
+        self._timeline.bind('<Configure>', lambda e: self._draw_timeline())
+        self._timeline.bind('<Button-1>', self._on_timeline_press)
+        self._timeline.bind('<B1-Motion>', self._on_timeline_drag)
+        self._timeline.bind('<ButtonRelease-1>', self._on_timeline_release)
+
+        # ── Playback controls (bottom, above the timeline) ───────────────────
         controls = customtkinter.CTkFrame(self._viewer_page, fg_color='transparent')
-        controls.pack(fill='x', padx=20, pady=(2, 10))
+        controls.pack(side='bottom', fill='x', padx=20, pady=(2, 2))
         self._play_btn = customtkinter.CTkButton(controls, text='▶', width=44,
                                                  command=self._toggle_play)
         self._play_btn.pack(side='left')
@@ -518,6 +589,31 @@ class ClipBrowser(customtkinter.CTkToplevel):
         self._time_total = customtkinter.CTkLabel(controls, text='0:00', width=44)
         self._time_total.pack(side='left', padx=(4, 0))
 
+        # ── Video area (fills the remaining space, scales with the window) ───
+        self._video_container = customtkinter.CTkFrame(self._viewer_page, fg_color='#000000')
+        self._video_container.pack(side='top', fill='both', expand=True, padx=16, pady=4)
+        self._video_container.bind('<Configure>', self._on_video_resize)
+        self._video_label = customtkinter.CTkLabel(self._video_container, text='', fg_color='#000000')
+        self._video_label.place(relx=0.5, rely=0.5, anchor='center')
+        # One persistent CTkImage is reused for every frame (light_image only, so
+        # resizing never trips CTkImage's light/dark size-match check).
+        self._black_pil = Image.new('RGB', (16, 9), '#000000')
+        self._frame_img = customtkinter.CTkImage(light_image=self._black_pil, size=(self.VID_W, self.VID_H))
+        self._video_label.configure(image=self._frame_img)
+
+    def _video_box(self):
+        """Available (w, h) for the video, from the current container size."""
+        w = self._video_container.winfo_width() - 8
+        h = self._video_container.winfo_height() - 8
+        if w < 80 or h < 60:
+            return self.VID_W, self.VID_H
+        return w, h
+
+    def _on_video_resize(self, _event):
+        # Re-render the current frame to the new size when the window is resized
+        if self._player is not None:
+            self._show_frame(self._player.position)
+
     def _open_viewer(self, path):
         self._close_player()
         self._current_path = path
@@ -529,6 +625,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
         self._play_btn.configure(text='▶')
         self._slider.set(0)
         self._time_cur.configure(text='0:00')
+        self._reset_edit_state(0.0)
         self._show_page('viewer')
         threading.Thread(target=self._load_player, args=(path, token), daemon=True).start()
 
@@ -555,6 +652,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
         self._player = player
         self._slider.configure(to=max(player.duration, 0.05))
         self._time_total.configure(text=fmt_time(player.duration))
+        self._reset_edit_state(player.duration)
         self._show_frame(0.0)
         player.play()
         self._play_btn.configure(text='❚❚')
@@ -594,13 +692,265 @@ class ClipBrowser(customtkinter.CTkToplevel):
         if frame is None:
             return
         h, w = frame.shape[:2]
-        scale = min(self.VID_W / w, self.VID_H / h)
+        box_w, box_h = self._video_box()
+        scale = min(box_w / w, box_h / h)
         nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
         resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
         # Reuse the one persistent CTkImage instead of creating a new one
         self._frame_img.configure(light_image=pil, size=(nw, nh))
+
+    # ── Clip editor: trim + cuts on the timeline ─────────────────────────────
+    def _reset_edit_state(self, duration):
+        self._edit_start = 0.0
+        self._edit_end = max(duration, 0.001)
+        self._cuts = []
+        self._pending_cut = None
+        self._drag_handle = None
+        if hasattr(self, '_cut_btn'):
+            self._cut_btn.configure(text='✂ Cut')
+        self._update_edit_info()
+        self._draw_timeline()
+
+    def _tl_geom(self):
+        c = self._timeline
+        W = c.winfo_width()
+        dur = self._player.duration if self._player else 0.001
+        return 6, max(W - 6, 7), max(dur, 0.001)
+
+    def _t_to_x(self, t):
+        x0, x1, dur = self._tl_geom()
+        return x0 + (min(max(t, 0), dur) / dur) * (x1 - x0)
+
+    def _x_to_t(self, x):
+        x0, x1, dur = self._tl_geom()
+        return min(max((x - x0) / max(x1 - x0, 1), 0.0), 1.0) * dur
+
+    def _draw_timeline(self):
+        c = getattr(self, '_timeline', None)
+        if c is None or not c.winfo_exists():
+            return
+        c.delete('all')
+        W, H = c.winfo_width(), int(c['height'])
+        if W < 20 or not self._player:
+            return
+        x0, x1, dur = self._tl_geom()
+        top, bot = 8, H - 8
+        tx = self._t_to_x
+        # whole clip starts as "removed", then paint the kept range over it
+        c.create_rectangle(x0, top, x1, bot, fill='#3a2626', outline='')
+        c.create_rectangle(tx(self._edit_start), top, tx(self._edit_end), bot,
+                           fill='#1f3d63', outline='')
+        for cs, ce in self._cuts:                       # cut regions
+            c.create_rectangle(tx(cs), top, tx(ce), bot, fill='#7a2f2f', outline='')
+        if self._pending_cut is not None:               # in-progress cut
+            xp = tx(self._pending_cut)
+            c.create_line(xp, top, xp, bot, fill='#e08a3a', width=2)
+        for t in (self._edit_start, self._edit_end):    # trim handles
+            x = tx(t)
+            c.create_rectangle(x - 3, top - 3, x + 3, bot + 3,
+                               fill='#dce4ee', outline='#1f538d')
+        ph = self._player.position                      # playhead
+        xph = tx(ph)
+        c.create_line(xph, 0, xph, H, fill='#ffffff', width=1)
+
+    def _on_timeline_press(self, e):
+        if not self._player:
+            return
+        xs, xe = self._t_to_x(self._edit_start), self._t_to_x(self._edit_end)
+        if abs(e.x - xs) <= 10:
+            self._drag_handle = 'start'
+        elif abs(e.x - xe) <= 10:
+            self._drag_handle = 'end'
+        else:
+            self._drag_handle = None
+            self._seek_to(self._x_to_t(e.x))
+
+    def _on_timeline_drag(self, e):
+        if not self._player:
+            return
+        t = self._x_to_t(e.x)
+        if self._drag_handle == 'start':
+            self._edit_start = min(max(t, 0.0), self._edit_end - 0.05)
+            self._seek_to(self._edit_start)
+        elif self._drag_handle == 'end':
+            self._edit_end = max(min(t, self._player.duration), self._edit_start + 0.05)
+            self._seek_to(self._edit_end)
+        else:
+            self._seek_to(t)
+        self._update_edit_info()
+        self._draw_timeline()
+
+    def _on_timeline_release(self, _e):
+        self._drag_handle = None
+
+    def _seek_to(self, t):
+        p = self._player
+        if not p:
+            return
+        t = min(max(t, 0), p.duration)
+        p.seek(t)
+        self._set_slider(t)
+        self._show_frame(t)
+        self._time_cur.configure(text=fmt_time(t))
+        self._draw_timeline()
+
+    def _set_edit_start(self):
+        if not self._player:
+            return
+        self._edit_start = min(self._player.position, self._edit_end - 0.05)
+        self._edit_start = max(self._edit_start, 0.0)
+        self._update_edit_info()
+        self._draw_timeline()
+
+    def _set_edit_end(self):
+        if not self._player:
+            return
+        self._edit_end = max(self._player.position, self._edit_start + 0.05)
+        self._edit_end = min(self._edit_end, self._player.duration)
+        self._update_edit_info()
+        self._draw_timeline()
+
+    def _toggle_cut(self):
+        if not self._player:
+            return
+        t = self._player.position
+        if self._pending_cut is None:
+            self._pending_cut = t
+            self._cut_btn.configure(text='✂ End cut')
+        else:
+            cs, ce = sorted((self._pending_cut, t))
+            self._pending_cut = None
+            self._cut_btn.configure(text='✂ Cut')
+            if ce - cs > 0.05:
+                self._cuts.append([cs, ce])
+                self._cuts.sort()
+        self._update_edit_info()
+        self._draw_timeline()
+
+    def _reset_edits(self):
+        if self._player:
+            self._reset_edit_state(self._player.duration)
+
+    def _kept_segments(self):
+        segs, cursor = [], self._edit_start
+        for cs, ce in sorted(self._cuts):
+            cs, ce = max(cs, self._edit_start), min(ce, self._edit_end)
+            if ce <= cursor:
+                continue
+            if cs > cursor:
+                segs.append((cursor, cs))
+            cursor = max(cursor, ce)
+        if cursor < self._edit_end:
+            segs.append((cursor, self._edit_end))
+        return [(s, e) for s, e in segs if e - s > 0.05]
+
+    def _edit_output_len(self):
+        return sum(e - s for s, e in self._kept_segments())
+
+    def _has_edits(self):
+        if not self._player:
+            return False
+        return (self._edit_start > 0.05 or
+                self._edit_end < self._player.duration - 0.05 or
+                bool(self._cuts))
+
+    def _update_edit_info(self):
+        if not self._player or not hasattr(self, '_edit_info'):
+            return
+        n = len(self._cuts)
+        self._edit_info.configure(
+            text=f'Output {fmt_time(self._edit_output_len())} · {n} cut{"" if n == 1 else "s"}')
+
+    def _save_edits(self):
+        if not self._player or self._saving_edit:
+            return
+        if not self._has_edits():
+            self._show_message('Save edits', 'You have not made any edits yet.\n'
+                               'Drag the handles to trim, or use ✂ Cut to remove a section.')
+            return
+        if not self._kept_segments():
+            self._show_message('Save edits', 'There would be nothing left after your cuts.')
+            return
+        box = self._open_overlay()
+        stem = os.path.splitext(os.path.basename(self._current_path))[0]
+        customtkinter.CTkLabel(box, text='Save edited clip',
+                               font=customtkinter.CTkFont(size=15, weight='bold')).pack(padx=40, pady=(22, 6))
+        customtkinter.CTkLabel(box, text=f'"{stem}"  →  {fmt_time(self._edit_output_len())}',
+                               text_color='#8a8a8a').pack(padx=40)
+        row = customtkinter.CTkFrame(box, fg_color='transparent')
+        row.pack(padx=40, pady=(16, 20))
+        customtkinter.CTkButton(row, text='Overwrite original', width=140, fg_color='#a83232',
+                                hover_color='#c23a3a',
+                                command=lambda: self._begin_save('overwrite')).pack(side='left', padx=6)
+        customtkinter.CTkButton(row, text='Save as copy', width=130,
+                                command=lambda: self._begin_save('copy')).pack(side='left', padx=6)
+        customtkinter.CTkButton(box, text='Cancel', width=100, fg_color='#3a3a3a',
+                                hover_color='#4a4a4a', command=self._close_overlay).pack(pady=(0, 18))
+
+    def _unique_copy_path(self, src):
+        stem = os.path.splitext(os.path.basename(src))[0]
+        base = os.path.join(CLIP_FOLDER, f'{stem} (edited)')
+        path = base + '.mp4'
+        i = 2
+        while os.path.exists(path):
+            path = f'{base} {i}.mp4'
+            i += 1
+        return path
+
+    def _begin_save(self, mode):
+        segs = self._kept_segments()
+        if not segs:
+            return
+        self._close_overlay()
+        src = self._current_path
+        has_audio = self._player is not None and self._player.audio is not None
+        self._saving_edit = True
+        self._load_token += 1                       # cancel any pending viewer render
+        self._close_player()                        # release the file handle
+
+        if mode == 'copy':
+            final = self._unique_copy_path(src)
+            out = final
+        else:
+            final = src
+            # temp lives in the clip folder so os.replace is atomic (same drive)
+            out = os.path.join(CLIP_FOLDER, f'.edit_tmp_{int(time.time())}.mp4')
+
+        box = self._open_overlay()
+        customtkinter.CTkLabel(box, text='Saving edited clip…',
+                               font=customtkinter.CTkFont(size=15, weight='bold')).pack(padx=50, pady=26)
+        threading.Thread(target=self._do_save_edit,
+                         args=(src, out, final, mode, segs, has_audio), daemon=True).start()
+
+    def _do_save_edit(self, src, out, final, mode, segs, has_audio):
+        # Worker thread: no tkinter here — result is parked for the tick loop
+        try:
+            cmd = build_edit_cmd(src, out, segs, has_audio)
+            r = subprocess.run(cmd, capture_output=True, creationflags=SUBPROCESS_FLAGS)
+            if r.returncode != 0 or not os.path.exists(out):
+                raise RuntimeError((r.stderr or b'').decode('utf-8', 'replace')[:300] or 'encode failed')
+            if mode == 'overwrite':
+                os.replace(out, final)              # atomic same-drive replace
+            self._pending_save = ('ok', final)
+        except Exception as e:
+            try:
+                if mode == 'overwrite' and os.path.exists(out):
+                    os.remove(out)
+            except OSError:
+                pass
+            self._pending_save = ('error', str(e))
+
+    def _save_done(self, kind, payload):
+        self._saving_edit = False
+        self._close_overlay()
+        self._known_files = []                      # force a grid refresh on Back
+        if kind == 'ok':
+            self._open_viewer(payload)
+        else:
+            self._back_to_grid()
+            self._show_message('Save edits', f'Could not save the edited clip:\n{payload}')
 
     def _viewer_share(self):
         if self._player:
@@ -842,6 +1192,12 @@ class ClipBrowser(customtkinter.CTkToplevel):
             else:
                 self._load_failed(token, payload)
 
+        # Collect the result of an edit save
+        if self._pending_save is not None:
+            kind, payload = self._pending_save
+            self._pending_save = None
+            self._save_done(kind, payload)
+
         # Advance the viewer
         p = self._player
         if self._page == 'viewer' and p and p.playing and not self._scrubbing:
@@ -853,6 +1209,7 @@ class ClipBrowser(customtkinter.CTkToplevel):
             self._set_slider(pos)
             self._show_frame(pos)
             self._time_cur.configure(text=fmt_time(pos))
+            self._draw_timeline()
 
         # Reflect the compression worker's state onto the share page
         if self._share_state == 'working':

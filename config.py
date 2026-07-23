@@ -35,6 +35,11 @@ IS_FROZEN = getattr(sys, 'frozen', False)
 # way, but closing it kills the child process — truncating a clip mid-encode.)
 SUBPROCESS_FLAGS = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW
 
+# Output resolutions the user can pick — value is the target height in pixels
+# (width is derived to keep the aspect ratio).
+RESOLUTION_MAP = {'320p': 320, '480p': 480, '720p': 720, '1080p': 1080, '4K': 2160}
+RESOLUTION_OPTIONS = ['320p', '480p', '720p', '1080p', '4K']
+
 
 def resource_path(*parts):
     """Path to a file bundled with the app (PyInstaller unpacks to _MEIPASS)."""
@@ -57,6 +62,35 @@ if FIRST_RUN:
         shutil.copyfile(resource_path('defaults.csv'), CONFIG_PATH)
     except Exception as e:
         print(f'Could not create settings file: {e}')
+
+
+def _ensure_config_keys():
+    """Add any settings a newer version introduced to an older user's file, so
+    upgrades don't lose new options (write_to_file only updates existing keys)."""
+    try:
+        defaults, order = {}, []
+        with open(resource_path('defaults.csv'), newline='') as f:
+            for row in csv.reader(f):
+                if len(row) >= 2:
+                    defaults[row[0]] = row[1]
+                    order.append(row[0])
+        rows, have = [], set()
+        with open(CONFIG_PATH, newline='') as f:
+            for row in csv.reader(f):
+                if row:
+                    rows.append(row)
+                    have.add(row[0])
+        missing = [k for k in order if k not in have]
+        if missing:
+            for k in missing:
+                rows.append([k, defaults[k]])
+            with open(CONFIG_PATH, 'w', newline='') as f:
+                csv.writer(f).writerows(rows)
+    except Exception as e:
+        print(f'Config migration error: {e}')
+
+
+_ensure_config_keys()
 
 root = tk.Tk()
 SCREEN_WIDTH = root.winfo_screenwidth()
@@ -270,6 +304,12 @@ class AudioManager:
         except (TypeError, ValueError):
             return default
 
+    def _read_float(self, pointer, default):
+        try:
+            return float(self.main.read_from_file(pointer))
+        except (TypeError, ValueError):
+            return default
+
     def start(self):
         self.stop()
         # Keep a little headroom over the clip length so a full clip is always covered
@@ -308,22 +348,30 @@ class AudioManager:
 
     def get_clip_audio(self, t_start, t_end):
         """Returns the mixed audio (float32 stereo) for the wall-clock window
-        [t_start, t_end], aligned to the video timeline, or None."""
+        [t_start, t_end], aligned to the video timeline, or None.
+
+        Each source is scaled by its volume slider (0..1, where 0.5 = unchanged,
+        1 = doubled). Scaling float samples is lossless, so turning a source up
+        or down never degrades quality — the only cap is that the final mix is
+        gently normalised if it would exceed full scale, which prevents clipping
+        distortion."""
+        mic_gain = 2.0 * self._read_float('mic_volume', 0.5)
+        int_gain = 2.0 * self._read_float('internal_volume', 0.5)
+
         arrays = []
         for s in self.sources:
             a = s.get_window(t_start, t_end)
             if a is not None and len(a):
-                arrays.append(a)
+                gain = int_gain if s.loopback else mic_gain
+                arrays.append(a * gain if gain != 1.0 else a)
         if not arrays:
             return None
-        if len(arrays) == 1:
-            return arrays[0]
 
         # Every source window is the same length, so they line up sample-for-sample
         n = min(len(a) for a in arrays)
-        mixed = numpy.sum([a[:n] for a in arrays], axis=0)
+        mixed = numpy.sum([a[:n] for a in arrays], axis=0) if len(arrays) > 1 else arrays[0]
 
-        # Soft protection against clipping when several loud sources overlap
+        # Soft protection against clipping (loud sources or a boosted volume)
         peak = numpy.abs(mixed).max()
         if peak > 1.0:
             mixed = mixed / peak
