@@ -25,7 +25,6 @@ import json
 import wave
 import tempfile
 import ctypes
-import queue
 from collections import deque
 
 # ── Paths (work both from source and from the packaged .exe) ────────────────
@@ -478,10 +477,9 @@ class ScreenCapture(threading.Thread):
         self.width = 0
         self.height = 0
         self.backend = None
-        # Grabbed frames wait here to be JPEG-encoded on a separate thread, so
-        # the encode never sits in the grab loop's critical path (that was
-        # capping the frame rate under load).
-        self._encode_q = queue.Queue(maxsize=8)
+        self._fps_count = 0
+        self._fps_since = 0.0
+        self.capture_fps = 0.0        # last measured real capture rate (for diagnostics)
 
     # Frame storage (shared by both backends) --------------------------------
     def _append(self, ts, jpeg, clip_length):
@@ -494,36 +492,19 @@ class ScreenCapture(threading.Thread):
                 _, old = self.frames.popleft()
                 self._bytes -= len(old)
 
-    def _queue_frame(self, ts, frame, clip_length):
-        """Hand a grabbed frame to the encode thread. `frame` is None for a
-        heartbeat (re-use the last encoded frame). Non-blocking: if the encoder
-        has fallen behind we drop this frame rather than stall the grab loop."""
-        try:
-            self._encode_q.put_nowait((ts, frame, clip_length))
-        except queue.Full:
-            pass
-
-    def _encode_worker(self):
-        """Consumes grabbed frames, JPEG-encodes them (in timestamp order) and
-        stores them. One worker keeps frames ordered; its ~400fps encode
-        capacity is far more than the grab loop produces."""
-        last_jpeg = None
-        while self._running:
-            try:
-                ts, frame, clip_length = self._encode_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                if frame is None:                      # heartbeat: reuse last frame
-                    if last_jpeg is not None:
-                        self._append(ts, last_jpeg, clip_length)
-                    continue
-                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                if ok:
-                    last_jpeg = buf.tobytes()
-                    self._append(ts, last_jpeg, clip_length)
-            except Exception as e:
-                print(f'Encode error: {e}')
+    def _count_fps(self, now, real):
+        """Track and periodically log the actual capture rate. `real` is False
+        for heartbeat/duplicate frames so the number reflects true new frames."""
+        if real:
+            self._fps_count += 1
+        if self._fps_since == 0.0:
+            self._fps_since = now
+        elapsed = now - self._fps_since
+        if elapsed >= 3.0:
+            self.capture_fps = self._fps_count / elapsed
+            print(f'Capture: {self.capture_fps:.1f} fps ({self.backend})')
+            self._fps_count = 0
+            self._fps_since = now
 
     def _set_monitor(self, mon):
         self.monitor = mon
@@ -539,19 +520,13 @@ class ScreenCapture(threading.Thread):
 
     def run(self):
         self._running = True
-        # Encoding runs on its own thread; the grab loop just hands off frames
-        worker = threading.Thread(target=self._encode_worker, daemon=True)
-        worker.start()
+        # Try the fast GPU path first; on any problem, fall back to BitBlt
         try:
-            # Try the fast GPU path first; on any problem, fall back to BitBlt
-            try:
-                if self._run_dxcam():
-                    return
-            except Exception as e:
-                print(f'dxcam unavailable, using mss fallback: {e}')
-            self._run_mss()
-        finally:
-            self._running = False
+            if self._run_dxcam():
+                return
+        except Exception as e:
+            print(f'dxcam unavailable, using mss fallback: {e}')
+        self._run_mss()
 
     # Fast path: Desktop Duplication via dxcam -------------------------------
     def _run_dxcam(self):
@@ -571,6 +546,7 @@ class ScreenCapture(threading.Thread):
 
         cam = None
         cur_key = None
+        last_jpeg = None
         last_raw = None
         last_cursor = None
         last_store = 0.0
@@ -602,7 +578,7 @@ class ScreenCapture(threading.Thread):
                     cur_key = key
                     self.backend = 'dxcam'
                     self._set_monitor(mon)
-                    last_raw = None
+                    last_jpeg = last_raw = None
 
                 now = time.time()
                 if now < next_frame:
@@ -623,18 +599,15 @@ class ScreenCapture(threading.Thread):
                 mouse = getattr(bc, 'mouse_enabled', 0)
                 to_encode = None
 
-                # Frames handed to the encode thread must be copies — dxcam
-                # reuses its internal buffer on the next grab, which would
-                # corrupt a frame still waiting in the queue.
                 if frame is not None:
+                    last_raw = frame
                     if mouse:
-                        last_raw = frame.copy()        # clean copy for cursor-on-static
-                        f = last_raw.copy()
+                        f = frame.copy()           # don't scribble on dxcam's buffer
                         draw_cursor(f, mon)
                         last_cursor = _cursor_pos()
                         to_encode = f
                     else:
-                        to_encode = frame.copy()
+                        to_encode = frame
                 elif mouse and last_raw is not None and _cursor_pos() != last_cursor:
                     # Screen static but the cursor moved — refresh it on the last frame
                     f = last_raw.copy()
@@ -643,13 +616,17 @@ class ScreenCapture(threading.Thread):
                     to_encode = f
 
                 if to_encode is not None:
-                    self._queue_frame(now, to_encode, clip_length)
+                    ok, buf = cv2.imencode('.jpg', to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                    if ok:
+                        last_jpeg = buf.tobytes()
+                        self._append(now, last_jpeg, clip_length)
+                        last_store = now
+                    self._count_fps(now, True)
+                elif last_jpeg is not None and now - last_store >= self.HEARTBEAT:
+                    # Keep the timeline current cheaply — reuse the same bytes
+                    self._append(now, last_jpeg, clip_length)
                     last_store = now
-                elif now - last_store >= self.HEARTBEAT:
-                    # Keep the timeline current cheaply — the worker re-uses the
-                    # last encoded frame for this heartbeat
-                    self._queue_frame(now, None, clip_length)
-                    last_store = now
+                    self._count_fps(now, False)
 
                 next_frame += frame_interval
                 if now - next_frame > frame_interval * 3:
@@ -705,7 +682,11 @@ class ScreenCapture(threading.Thread):
                     frame = numpy.array(sct.grab(mon))  # BGRA
                     if getattr(bc, 'mouse_enabled', 0):
                         draw_cursor(frame, mon)
-                    self._queue_frame(time.time(), frame, clip_length)
+                    ts = time.time()
+                    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                    if ok:
+                        self._append(ts, buf.tobytes(), clip_length)
+                    self._count_fps(ts, True)
                     grab_errors = 0
                 except Exception as e:
                     grab_errors += 1
