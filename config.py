@@ -107,19 +107,26 @@ def create_icon_image():
 
 TRAY_ICON = create_icon_image() # Stores the icon image for if it is minimized to tray
 
+# Encoder settings, per GPU brand. Each uses constant-quality rate control (the
+# lower the number, the better it looks) rather than the encoders' low default
+# bitrate — that default was making 1080p clips look soft/blocky. Encoding
+# happens after the clip is captured, so a slower/higher-quality preset is fine.
+CQ = '20'   # constant-quality target — visually clean, ~10-20 Mbps at 1080p60
+
+CPU_CODEC = ['-c:v', 'libx264', '-preset', 'fast', '-crf', CQ]
+
 # Gets the gpu brand and returns the appropriate flags
 def get_gpu():
     try:
         cmd = 'PowerShell -Command "Get-CimInstance Win32_VideoController | Select-Object Name | ConvertTo-Json'
         output = subprocess.check_output(cmd, shell=True, text=True,
                                          creationflags=SUBPROCESS_FLAGS).strip()
-        gpu_name_lower = output.lower()
 
         print('GPU: ' + output)
 
         if not output:
             print("No GPU data returned from system query. Defaulting to CPU.")
-            return ['-c:v', 'libx264', '-preset', 'ultrafast']
+            return CPU_CODEC
 
         # Parse the output (handles single or multiple GPUs safely)
         gpu_data = json.loads(output)
@@ -131,21 +138,39 @@ def get_gpu():
             gpu_names = gpu_data['Name'].lower()
 
         if 'nvidia' in gpu_names:
-            return ['-c:v', 'h264_nvenc', '-preset', 'p1']
-
+            return ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', CQ, '-b:v', '0']
         elif 'amd' in gpu_names:
-            return ['-c:v', 'h264_amf', '-quality', 'speed']
-        elif 'inter' in gpu_names:
-            return ['-c:v', 'h264_qsv', '-preset', 'veryfast']
-    except:
+            return ['-c:v', 'h264_amf', '-rc', 'cqp', '-qp_i', CQ, '-qp_p', CQ, '-qp_b', CQ, '-quality', 'quality']
+        elif 'intel' in gpu_names or 'inter' in gpu_names:
+            return ['-c:v', 'h264_qsv', '-preset', 'medium', '-global_quality', CQ]
+    except Exception:
         print('Detection Failed! Defaulting to CPU encoding')
 
-    return ['-c:v', 'libx264', '-preset', 'ultrafast']
+    return CPU_CODEC
 
-GPU_CODEC_FLAGS = get_gpu()
+
+def _verify_encoder(flags):
+    """Make sure the chosen GPU encoder actually works on this machine — some
+    drivers advertise it but fail. Falls back to CPU (libx264) if it doesn't."""
+    if flags is CPU_CODEC:
+        return flags
+    try:
+        test = [FFMPEG_PATH, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=256x144:d=1:r=30',
+                *flags, '-pix_fmt', 'yuv420p', '-f', 'null', '-']
+        r = subprocess.run(test, capture_output=True, creationflags=SUBPROCESS_FLAGS, timeout=25)
+        if r.returncode == 0:
+            return flags
+        print(f'GPU encoder {flags[1]} failed a test encode, using CPU (libx264).')
+    except Exception as e:
+        print(f'GPU encoder test error ({e}), using CPU (libx264).')
+    return CPU_CODEC
 
 # Absolute path to the bundled ffmpeg so it resolves no matter the launch directory
 FFMPEG_PATH = resource_path('bin', 'ffmpeg.exe')
+
+# Pick the encoder now (verifying the GPU one actually works), so the cost is
+# paid once at startup rather than on every clip.
+GPU_CODEC_FLAGS = _verify_encoder(get_gpu())
 
 
 # Handles the location to save the clip (always in the user's pictures directory and in a folder called clipping)
@@ -171,9 +196,15 @@ AUDIO_CHUNK = 2048
 # briefly stalling under load without dropping samples
 AUDIO_BUFFER_BLOCK = SAMPLE_RATE // 10
 
+# Quality of the JPEG frames held in the rolling buffer. This is the source the
+# final clip is encoded from, so a low value makes even a high-bitrate clip look
+# soft. 90 keeps captured detail; the trade-off is more RAM per frame.
+JPEG_QUALITY = 90
+
 # Hard cap on the video ring buffer so a long clip length can't eat all the RAM.
 # Frames past this budget are dropped oldest-first (the clip just gets shorter).
-MAX_BUFFER_BYTES = 700 * 1024 * 1024
+# Raised to fit a full clip of the higher-quality frames above.
+MAX_BUFFER_BYTES = 2000 * 1024 * 1024
 
 
 def write_wav(path, data, samplerate=SAMPLE_RATE):
@@ -568,7 +599,7 @@ class ScreenCapture(threading.Thread):
                     to_encode = f
 
                 if to_encode is not None:
-                    ok, buf = cv2.imencode('.jpg', to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    ok, buf = cv2.imencode('.jpg', to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                     if ok:
                         last_jpeg = buf.tobytes()
                         self._append(now, last_jpeg, clip_length)
@@ -632,7 +663,7 @@ class ScreenCapture(threading.Thread):
                     frame = numpy.array(sct.grab(mon))  # BGRA
                     if getattr(bc, 'mouse_enabled', 0):
                         draw_cursor(frame, mon)
-                    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                     if ok:
                         self._append(time.time(), buf.tobytes(), clip_length)
                     grab_errors = 0

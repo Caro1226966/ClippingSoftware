@@ -9,7 +9,7 @@
 ; (run PyInstaller first so dist\ClippingSoftware.exe exists)
 
 #define MyAppName "Clipping Software"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "Caro122"
 #define MyAppExeName "ClippingSoftware.exe"
 
