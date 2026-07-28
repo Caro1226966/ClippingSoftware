@@ -55,6 +55,18 @@ APP_DIR = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'),
 os.makedirs(APP_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(APP_DIR, 'defaults.csv')
 LOG_PATH = os.path.join(APP_DIR, 'log.txt')
+# Capture diagnostics go to their own file with a dedicated handle, so they work
+# regardless of how the app was launched (the stdout redirect in main.py can be
+# defeated by an update-time relaunch; this path can't).
+DIAG_PATH = os.path.join(APP_DIR, 'capture_diag.log')
+
+
+def diag(msg):
+    try:
+        with open(DIAG_PATH, 'a', encoding='utf-8', errors='replace') as f:
+            f.write(f'{time.strftime("%H:%M:%S")} {msg}\n')
+    except Exception:
+        pass
 
 # First launch on this machine: seed the settings file from the bundled defaults
 FIRST_RUN = not os.path.exists(CONFIG_PATH)
@@ -516,6 +528,8 @@ class ScreenCapture(threading.Thread):
         self._fps_count = 0
         self._fps_since = 0.0
         self.capture_fps = 0.0        # last measured real capture rate (for diagnostics)
+        self._delivered = 0           # frames WGC handed us in the window
+        self._dropped = 0             # frames dropped because the encoder fell behind
         # WGC delivers frames on its own thread and stalls if that thread is
         # busy, so JPEG-encoding must not happen there — grabbed frames are
         # queued and encoded on this worker instead.
@@ -538,7 +552,7 @@ class ScreenCapture(threading.Thread):
         try:
             self._encode_q.put_nowait((ts, frame, clip_length))
         except queue.Full:
-            pass
+            self._dropped += 1
 
     def _encode_worker(self):
         """Encodes queued frames to JPEG off the capture thread, in order.
@@ -575,8 +589,18 @@ class ScreenCapture(threading.Thread):
         elapsed = now - self._fps_since
         if elapsed >= 3.0:
             self.capture_fps = self._fps_count / elapsed
-            print(f'Capture: {self.capture_fps:.1f} fps ({self.backend})')
+            deliv = self._delivered / elapsed
+            drop = self._dropped / elapsed
+            # delivered = what WGC gave us; stored = what survived encoding;
+            # dropped = frames the encoder couldn't keep up with. Comparing these
+            # says whether a stall is the capture backend or the encoder.
+            line = (f'Capture: {self.capture_fps:.1f} fps stored | '
+                    f'{deliv:.1f} delivered | {drop:.1f} dropped ({self.backend})')
+            print(line)
+            diag(line)
             self._fps_count = 0
+            self._delivered = 0
+            self._dropped = 0
             self._fps_since = now
 
     def _set_monitor(self, mon):
@@ -599,6 +623,12 @@ class ScreenCapture(threading.Thread):
 
     def run(self):
         self._running = True
+        # Fresh diagnostics each session (own file handle, launch-context proof)
+        try:
+            open(DIAG_PATH, 'w', encoding='utf-8').close()
+        except Exception:
+            pass
+        diag('capture starting')
         # Keep the recorder scheduled even when a game is hammering the CPU
         self._boost_process_priority()
         self._boost_current_thread()  # this thread supervises WGC delivery
@@ -657,6 +687,7 @@ class ScreenCapture(threading.Thread):
                         pass
                     return
                 now = time.time()
+                self._delivered += 1  # WGC gave us a frame (before any drop)
                 try:
                     st['clip_length'] = float(bc.clip_length)
                 except (TypeError, ValueError):
