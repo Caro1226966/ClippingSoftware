@@ -68,6 +68,11 @@ def diag(msg):
     except Exception:
         pass
 
+
+class _RECT(ctypes.Structure):
+    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
 # First launch on this machine: seed the settings file from the bundled defaults
 FIRST_RUN = not os.path.exists(CONFIG_PATH)
 if FIRST_RUN:
@@ -621,6 +626,54 @@ class ScreenCapture(threading.Thread):
         except (TypeError, ValueError):
             return 60
 
+    # Foreground game/window auto-detection ----------------------------------
+    _SHELL_CLASSES = ('Progman', 'WorkerW', 'Shell_TrayWnd', 'Windows.UI.Core.CoreWindow')
+
+    def _game_window(self):
+        """HWND (int) of the foreground app window worth capturing directly, or
+        None to fall back to whole-monitor capture.
+
+        Capturing the game's own window bypasses the desktop compositor, which
+        gets starved to ~12fps when a game maxes the GPU (whole-screen capture
+        can only ever see what the compositor finished drawing). We return a
+        window only when the foreground is a real, visible, substantial
+        top-level window that isn't ours or the desktop/taskbar — so any game
+        (fullscreen or borderless) is captured smoothly, while sitting at the
+        desktop still records the whole screen."""
+        try:
+            u = ctypes.windll.user32
+            u.GetForegroundWindow.restype = ctypes.c_void_p
+            hwnd = u.GetForegroundWindow()
+            if not hwnd:
+                return None
+            for fn, args in ((u.IsWindowVisible, [ctypes.c_void_p]),
+                             (u.IsIconic, [ctypes.c_void_p])):
+                fn.argtypes = args
+            if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):
+                return None
+            # never capture our own window
+            u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                   ctypes.POINTER(ctypes.c_ulong)]
+            pid = ctypes.c_ulong(0)
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == os.getpid():
+                return None
+            # skip the desktop / taskbar / shell surfaces
+            u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+            buf = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, buf, 256)
+            if buf.value in self._SHELL_CLASSES:
+                return None
+            # skip tiny popups / tooltips — require a real window
+            u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+            r = _RECT()
+            u.GetWindowRect(hwnd, ctypes.byref(r))
+            if (r.right - r.left) < 400 or (r.bottom - r.top) < 300:
+                return None
+            return int(hwnd)
+        except Exception:
+            return None
+
     def run(self):
         self._running = True
         # Fresh diagnostics each session (own file handle, launch-context proof)
@@ -656,31 +709,41 @@ class ScreenCapture(threading.Thread):
 
         while self._running:
             bc = self.main.button_callback
-            # Re-create the session whenever the monitor, cursor toggle or fps
-            # changes (these are fixed when the capture session is created)
-            cur = (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)), self._safe_fps(bc))
             self._set_monitor(self._resolve_monitor(monitors, bc))
-            st = {'last_store': 0.0, 'last_jpeg': None, 'clip_length': 60.0}
+            # Capture the foreground window when there is a game/app in front
+            # (smooth — it bypasses the compositor bottleneck), otherwise the
+            # whole monitor. The target is part of `cur`, so the session rebuilds
+            # automatically when the user alt-tabs into or out of a game.
+            win = self._game_window()
+            cur = (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)),
+                   self._safe_fps(bc), win)
+            st = {'last_store': 0.0, 'clip_length': 60.0, 'rebuild': False}
 
             try:
-                cap = windows_capture.WindowsCapture(
-                    cursor_capture=cur[1], draw_border=False,
-                    minimum_update_interval=max(int(1000 / cur[2]), 1),
-                    monitor_index=cur[0] + 1)
+                if win:
+                    cap = windows_capture.WindowsCapture(
+                        cursor_capture=cur[1], draw_border=False,
+                        minimum_update_interval=max(int(1000 / cur[2]), 1),
+                        window_hwnd=win)
+                else:
+                    cap = windows_capture.WindowsCapture(
+                        cursor_capture=cur[1], draw_border=False,
+                        minimum_update_interval=max(int(1000 / cur[2]), 1),
+                        monitor_index=cur[0] + 1)
             except Exception as e:
                 print(f'WGC create failed: {e}')
+                if win:
+                    # window capture failed (e.g. the window just closed) — retry
+                    # this loop, which will fall back to whole-monitor capture
+                    time.sleep(0.2)
+                    continue
                 return False
-
-            def _changed():
-                return (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)),
-                        self._safe_fps(bc)) != cur
 
             def on_frame_arrived(frame, capture_control):
                 # Runs on WGC's own delivery thread — it must stay fast, or WGC
-                # throttles its delivery rate (this was capping fullscreen games
-                # to a fraction of their real fps). So we only copy the pixels
-                # and hand them to the encode worker; the JPEG happens there.
-                if not self._running or _changed():
+                # throttles its delivery rate. So we only copy the pixels and
+                # hand them to the encode worker; the JPEG happens there.
+                if not self._running or st['rebuild']:
                     try:
                         capture_control.stop()
                     except Exception:
@@ -701,21 +764,41 @@ class ScreenCapture(threading.Thread):
 
             cap.event(on_frame_arrived)
             cap.event(on_closed)
-            self.backend = 'wgc'
+            self.backend = 'wgc-window' if win else 'wgc-monitor'
+            diag(f'capturing {"window 0x%x" % win if win else "monitor %d" % (cur[0]+1)}')
             try:
                 ctrl = cap.start_free_threaded()
             except Exception as e:
                 print(f'WGC start failed: {e}')
+                if win:
+                    time.sleep(0.2)
+                    continue
                 return False
 
             # Supervise on this thread: keep the timeline alive during static
-            # screens (WGC only fires on change) and watch for setting changes
-            while self._running and not _changed():
+            # screens (WGC only fires on change), and watch for the foreground
+            # target or settings changing. A brief focus flicker (a notification
+            # stealing focus for a moment) must not thrash the capture, so a new
+            # target has to persist for a few checks before we switch to it.
+            settings = cur[:3]
+            stable = 0
+            while self._running and not st['rebuild']:
                 time.sleep(0.1)
                 now = time.time()
                 if now - st['last_store'] >= self.HEARTBEAT:
                     self._queue_encode(now, None, st['clip_length'])  # heartbeat
                     st['last_store'] = now
+                # settings changes apply immediately; target changes debounce
+                if (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)),
+                        self._safe_fps(bc)) != settings:
+                    st['rebuild'] = True
+                elif self._game_window() != win:
+                    stable += 1
+                    if stable >= 4:  # ~0.4s of a consistent new foreground
+                        st['rebuild'] = True
+                        st['switch_target'] = True
+                else:
+                    stable = 0
 
             try:
                 ctrl.stop()
@@ -723,7 +806,13 @@ class ScreenCapture(threading.Thread):
                 pass
             if not self._running:
                 return True
-            # a setting changed — loop round and rebuild the session
+            # A genuine switch between capture sources (e.g. game window -> the
+            # desktop) means the frame size/content changes, so drop the buffered
+            # history — otherwise a clip could splice two differently-sized
+            # sources together and glitch on compile.
+            if st.get('switch_target'):
+                self.clear()
+            # target/setting changed — loop round and rebuild the session
 
         return True
 

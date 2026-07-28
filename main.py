@@ -412,12 +412,20 @@ class MainProgram(customtkinter.CTk):
             traceback.print_exc()  # never let the encode thread die noisily
 
     def _compile_clip(self, items, t_first, t_last, audio=None):
-        width = self.monitor['width']
-        height = self.monitor['height']
-
         if not items:
             print("No frames to compile!")
             return
+
+        # Take the real dimensions from the captured frame itself, not the
+        # monitor: game-window capture produces frames sized to the window, which
+        # may differ from the monitor resolution.
+        try:
+            first = cv2.imdecode(numpy.frombuffer(items[0][1], numpy.uint8),
+                                 cv2.IMREAD_COLOR)
+            height, width = first.shape[:2]
+        except Exception:
+            width = self.monitor['width']
+            height = self.monitor['height']
 
         # Re-time the captured frames to a constant fps so playback matches
         # real time even when the capture rate dipped under load
@@ -457,6 +465,10 @@ class MainProgram(customtkinter.CTk):
         target_h = RESOLUTION_MAP.get(self.read_from_file('resolution'), height)
         if target_h != height:
             ffmpeg_cmd += ['-vf', f'scale=-2:{target_h}']
+        else:
+            # Force even dimensions — a window capture can be an odd size, which
+            # yuv420p rejects. This is a no-op when the frame is already even.
+            ffmpeg_cmd += ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2']
 
         ffmpeg_cmd += [
             *GPU_CODEC_FLAGS,
