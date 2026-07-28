@@ -467,6 +467,41 @@ class ScreenCapture(threading.Thread):
 
     HEARTBEAT = 0.5  # during a static screen, restamp the last frame this often
 
+    # Windows scheduling constants. A demanding game running flat-out will
+    # otherwise starve our capture/encode threads of CPU time slices, which
+    # shows up as the capture stalling for a second at a time then bursting.
+    # Nudging the recorder above the game's default (Normal) priority keeps it
+    # scheduled without meaningfully slowing the game (it uses little total CPU).
+    ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+    THREAD_PRIORITY_HIGHEST = 2
+    # Documented Win32 pseudo-handles for "current process/thread". Using these
+    # directly (as pointer-sized values) avoids the 64-bit handle-truncation
+    # that silently breaks GetCurrentProcess/Thread when called bare via ctypes.
+    _CURRENT_PROCESS = ctypes.c_void_p(-1)
+    _CURRENT_THREAD = ctypes.c_void_p(-2)
+
+    @staticmethod
+    def _boost_process_priority():
+        try:
+            fn = ctypes.windll.kernel32.SetPriorityClass
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            if not fn(ScreenCapture._CURRENT_PROCESS,
+                      ScreenCapture.ABOVE_NORMAL_PRIORITY_CLASS):
+                print('Priority boost (process): SetPriorityClass returned 0')
+        except Exception as e:
+            print(f'Priority boost (process) skipped: {e}')
+
+    @staticmethod
+    def _boost_current_thread():
+        try:
+            fn = ctypes.windll.kernel32.SetThreadPriority
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            if not fn(ScreenCapture._CURRENT_THREAD,
+                      ScreenCapture.THREAD_PRIORITY_HIGHEST):
+                print('Priority boost (thread): SetThreadPriority returned 0')
+        except Exception as e:
+            print(f'Priority boost (thread) skipped: {e}')
+
     def __init__(self, main):
         super().__init__(daemon=True)
         self.main = main
@@ -509,6 +544,7 @@ class ScreenCapture(threading.Thread):
         """Encodes queued frames to JPEG off the capture thread, in order.
         A None frame is a heartbeat that re-stores the last encoded frame so the
         timeline stays current during a static screen."""
+        self._boost_current_thread()  # the JPEG encode must not get starved
         last_jpeg = None
         while self._running:
             try:
@@ -563,6 +599,9 @@ class ScreenCapture(threading.Thread):
 
     def run(self):
         self._running = True
+        # Keep the recorder scheduled even when a game is hammering the CPU
+        self._boost_process_priority()
+        self._boost_current_thread()  # this thread supervises WGC delivery
         # Encode worker runs alongside so the capture path never blocks on JPEG
         threading.Thread(target=self._encode_worker, daemon=True).start()
         # Windows Graphics Capture first — it's the only one of these that grabs

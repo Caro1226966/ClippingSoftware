@@ -8,16 +8,27 @@ import traceback
 # to a log file instead: printing to a missing stdout would otherwise crash it,
 # and this gives users something to look at when something goes wrong.
 if IS_FROZEN:
-    # Start a fresh log each launch, and retry a few times: right after an
-    # update the previous copy may still be shutting down and holding the file,
-    # which used to leave the new version with no log at all.
-    for _attempt in range(8):
+    # Start a fresh log each launch. Right after an update the previous copy may
+    # still be shutting down and holding the file; rather than give up (which
+    # used to leave the whole session with no log), keep retrying in the
+    # background so logging comes alive as soon as the old copy lets go.
+    def _open_log():
+        import threading
+        def _try():
+            for _ in range(120):  # up to ~60s of retries, then quietly stop
+                try:
+                    sys.stdout = sys.stderr = open(LOG_PATH, 'w', buffering=1,
+                                                   encoding='utf-8', errors='replace')
+                    return
+                except Exception:
+                    time.sleep(0.5)
+        # one quick synchronous attempt so early prints are usually captured
         try:
             sys.stdout = sys.stderr = open(LOG_PATH, 'w', buffering=1,
                                            encoding='utf-8', errors='replace')
-            break
         except Exception:
-            time.sleep(0.5)
+            threading.Thread(target=_try, daemon=True).start()
+    _open_log()
 
 _instance_mutex = None
 SHOW_EVENT_NAME = 'Caro122ClippingSoftwareShow'
