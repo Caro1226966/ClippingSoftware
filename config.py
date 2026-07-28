@@ -518,17 +518,114 @@ class ScreenCapture(threading.Thread):
         except Exception:
             return monitors[1] if len(monitors) > 1 else monitors[0]
 
+    def _safe_fps(self, bc):
+        try:
+            return max(int(bc.fps), 1)
+        except (TypeError, ValueError):
+            return 60
+
     def run(self):
         self._running = True
-        # Try the fast GPU path first; on any problem, fall back to BitBlt
-        try:
-            if self._run_dxcam():
+        # Windows Graphics Capture first — it's the only one of these that grabs
+        # fullscreen games at their real framerate (dxcam/mss capture the
+        # composited desktop, which fullscreen games bypass). Fall back through
+        # dxcam (Desktop Duplication) then mss (GDI) if it's unavailable.
+        for backend in (self._run_wgc, self._run_dxcam, self._run_mss):
+            if not self._running:
                 return
-        except Exception as e:
-            print(f'dxcam unavailable, using mss fallback: {e}')
-        self._run_mss()
+            try:
+                if backend() is not False:
+                    return
+            except Exception as e:
+                print(f'{backend.__name__} unavailable: {e}')
 
-    # Fast path: Desktop Duplication via dxcam -------------------------------
+    # Best path: Windows Graphics Capture (captures fullscreen games) ---------
+    def _run_wgc(self):
+        import windows_capture  # optional; ImportError -> dxcam fallback
+
+        with mss.MSS() as probe:
+            monitors = probe.monitors
+
+        while self._running:
+            bc = self.main.button_callback
+            # Re-create the session whenever the monitor, cursor toggle or fps
+            # changes (these are fixed when the capture session is created)
+            cur = (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)), self._safe_fps(bc))
+            self._set_monitor(self._resolve_monitor(monitors, bc))
+            st = {'last_store': 0.0, 'last_jpeg': None, 'clip_length': 60.0}
+
+            try:
+                cap = windows_capture.WindowsCapture(
+                    cursor_capture=cur[1], draw_border=False,
+                    minimum_update_interval=max(int(1000 / cur[2]), 1),
+                    monitor_index=cur[0] + 1)
+            except Exception as e:
+                print(f'WGC create failed: {e}')
+                return False
+
+            def _changed():
+                return (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)),
+                        self._safe_fps(bc)) != cur
+
+            def on_frame_arrived(frame, capture_control):
+                # Runs on the capture's own thread. WGC delivers a frame each
+                # time the screen changes (paced to the fps cap above), so a
+                # fullscreen game is captured at its real rate.
+                if not self._running or _changed():
+                    try:
+                        capture_control.stop()
+                    except Exception:
+                        pass
+                    return
+                now = time.time()
+                try:
+                    st['clip_length'] = float(bc.clip_length)
+                except (TypeError, ValueError):
+                    st['clip_length'] = 60.0
+                try:
+                    ok, buf = cv2.imencode('.jpg', frame.frame_buffer,
+                                           [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                    if ok:
+                        st['last_jpeg'] = buf.tobytes()
+                        self._append(now, st['last_jpeg'], st['clip_length'])
+                        st['last_store'] = now
+                        self._count_fps(now, True)
+                except Exception as e:
+                    print(f'WGC encode error: {e}')
+
+            def on_closed():
+                pass
+
+            cap.event(on_frame_arrived)
+            cap.event(on_closed)
+            self.backend = 'wgc'
+            try:
+                ctrl = cap.start_free_threaded()
+            except Exception as e:
+                print(f'WGC start failed: {e}')
+                return False
+
+            # Supervise on this thread: keep the timeline alive during static
+            # screens (WGC only fires on change) and watch for setting changes
+            while self._running and not _changed():
+                time.sleep(0.1)
+                now = time.time()
+                if st['last_jpeg'] is not None and now - st['last_store'] >= self.HEARTBEAT:
+                    self._append(now, st['last_jpeg'], st['clip_length'])
+                    st['last_store'] = now
+                    self._count_fps(now, False)
+
+            try:
+                ctrl.stop()
+            except Exception:
+                pass
+            if not self._running:
+                return True
+            # a setting changed — loop round and rebuild the session
+
+        return True
+
+    # Fallback: Desktop Duplication via dxcam --------------------------------
     def _run_dxcam(self):
         import dxcam  # optional dependency; ImportError -> mss fallback
 

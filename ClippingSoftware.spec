@@ -16,8 +16,9 @@ hiddenimports = [
 ]
 
 # These ship data files / native DLLs that PyInstaller can't infer on its own
-# (customtkinter themes, PortAudio, soundcard's WASAPI bindings, dxcam).
-for pkg in ('customtkinter', 'soundcard', 'sounddevice', 'dxcam'):
+# (customtkinter themes, PortAudio, soundcard's WASAPI bindings, dxcam, and the
+# windows_capture Rust extension used for fullscreen game capture).
+for pkg in ('customtkinter', 'soundcard', 'sounddevice', 'dxcam', 'windows_capture'):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
