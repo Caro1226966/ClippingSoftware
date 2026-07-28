@@ -9,7 +9,7 @@
 ; (run PyInstaller first so dist\ClippingSoftware.exe exists)
 
 #define MyAppName "Clipping Software"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "Caro122"
 #define MyAppExeName "ClippingSoftware.exe"
 
@@ -37,9 +37,13 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; Matches the mutex the app creates, so Setup can tell the user to close it
-; instead of failing to overwrite a running exe
+; Matches the mutex the app creates, so Setup detects a running copy
 AppMutex=Caro122ClippingSoftware
+; Force-close a running copy during update. Without this the old version keeps
+; running in memory after an install (the onefile exe runs from a temp copy, so
+; the on-disk file isn't locked), and the update silently never takes effect.
+CloseApplications=force
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -64,3 +68,26 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--show"; Description: "Start {#M
 
 ; Settings and saved clips are intentionally left behind on uninstall so a
 ; reinstall keeps them; clips live in Videos\clipping.
+
+[Code]
+// Guarantee the old copy is gone before we install over it, so the update
+// actually takes effect (CloseApplications can miss the temp-extracted onefile).
+procedure KillRunningApp;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM ClippingSoftware.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  KillRunningApp;
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillRunningApp;  // again just before copying files, in case it relaunched
+  Result := '';
+end;
