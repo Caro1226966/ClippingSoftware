@@ -664,15 +664,44 @@ class ScreenCapture(threading.Thread):
             u.GetClassNameW(hwnd, buf, 256)
             if buf.value in self._SHELL_CLASSES:
                 return None
-            # skip tiny popups / tooltips — require a real window
+            # Only capture the window when it fills the monitor it's on — i.e. a
+            # fullscreen / borderless / maximized game. Small or partial windows
+            # (a browser, explorer, the settings window you're clicking) are left
+            # to whole-monitor capture, which keeps the target stable instead of
+            # thrashing every time focus lands on some other window.
             u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
             r = _RECT()
             u.GetWindowRect(hwnd, ctypes.byref(r))
-            if (r.right - r.left) < 400 or (r.bottom - r.top) < 300:
+            w, h = r.right - r.left, r.bottom - r.top
+            mon_w, mon_h = self._monitor_size_of(hwnd)
+            if mon_w and (w < 0.85 * mon_w or h < 0.85 * mon_h):
+                return None
+            if w < 400 or h < 300:
                 return None
             return int(hwnd)
         except Exception:
             return None
+
+    def _monitor_size_of(self, hwnd):
+        """Pixel size of the monitor a window is on, or (0, 0) if unknown."""
+        try:
+            u = ctypes.windll.user32
+            u.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            u.MonitorFromWindow.restype = ctypes.c_void_p
+            hmon = u.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+
+            class _MI(ctypes.Structure):
+                _fields_ = [('cbSize', ctypes.c_ulong), ('rcMonitor', _RECT),
+                            ('rcWork', _RECT), ('dwFlags', ctypes.c_ulong)]
+            mi = _MI()
+            mi.cbSize = ctypes.sizeof(_MI)
+            u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MI)]
+            if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return (mi.rcMonitor.right - mi.rcMonitor.left,
+                        mi.rcMonitor.bottom - mi.rcMonitor.top)
+        except Exception:
+            pass
+        return (0, 0)
 
     def run(self):
         self._running = True
@@ -781,24 +810,31 @@ class ScreenCapture(threading.Thread):
             # stealing focus for a moment) must not thrash the capture, so a new
             # target has to persist for a few checks before we switch to it.
             settings = cur[:3]
-            stable = 0
+            cand, cand_count = None, 0
             while self._running and not st['rebuild']:
                 time.sleep(0.1)
                 now = time.time()
                 if now - st['last_store'] >= self.HEARTBEAT:
                     self._queue_encode(now, None, st['clip_length'])  # heartbeat
                     st['last_store'] = now
-                # settings changes apply immediately; target changes debounce
+                # settings changes apply immediately
                 if (bc.monitor, bool(getattr(bc, 'mouse_enabled', 0)),
                         self._safe_fps(bc)) != settings:
                     st['rebuild'] = True
-                elif self._game_window() != win:
-                    stable += 1
-                    if stable >= 4:  # ~0.4s of a consistent new foreground
+                    continue
+                # Target changes only after a SINGLE new target holds steady for
+                # ~1.5s — long enough that alt-tabbing, notifications, or focus
+                # bouncing between windows never switches the capture source.
+                t = self._game_window()
+                if t == win:
+                    cand, cand_count = None, 0
+                elif t == cand:
+                    cand_count += 1
+                    if cand_count >= 15:
                         st['rebuild'] = True
                         st['switch_target'] = True
                 else:
-                    stable = 0
+                    cand, cand_count = t, 1
 
             try:
                 ctrl.stop()
