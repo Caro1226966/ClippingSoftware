@@ -25,6 +25,7 @@ import json
 import wave
 import tempfile
 import ctypes
+import queue
 from collections import deque
 
 # ── Paths (work both from source and from the packaged .exe) ────────────────
@@ -480,6 +481,10 @@ class ScreenCapture(threading.Thread):
         self._fps_count = 0
         self._fps_since = 0.0
         self.capture_fps = 0.0        # last measured real capture rate (for diagnostics)
+        # WGC delivers frames on its own thread and stalls if that thread is
+        # busy, so JPEG-encoding must not happen there — grabbed frames are
+        # queued and encoded on this worker instead.
+        self._encode_q = queue.Queue(maxsize=8)
 
     # Frame storage (shared by both backends) --------------------------------
     def _append(self, ts, jpeg, clip_length):
@@ -491,6 +496,38 @@ class ScreenCapture(threading.Thread):
             while self.frames and (self.frames[0][0] < cutoff or self._bytes > MAX_BUFFER_BYTES):
                 _, old = self.frames.popleft()
                 self._bytes -= len(old)
+
+    def _queue_encode(self, ts, frame, clip_length):
+        """Hand a grabbed frame to the encode worker (non-blocking; drop if the
+        worker has fallen behind, rather than stall the capture thread)."""
+        try:
+            self._encode_q.put_nowait((ts, frame, clip_length))
+        except queue.Full:
+            pass
+
+    def _encode_worker(self):
+        """Encodes queued frames to JPEG off the capture thread, in order.
+        A None frame is a heartbeat that re-stores the last encoded frame so the
+        timeline stays current during a static screen."""
+        last_jpeg = None
+        while self._running:
+            try:
+                ts, frame, clip_length = self._encode_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if frame is None:
+                    if last_jpeg is not None:
+                        self._append(ts, last_jpeg, clip_length)
+                        self._count_fps(ts, False)
+                    continue
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                if ok:
+                    last_jpeg = buf.tobytes()
+                    self._append(ts, last_jpeg, clip_length)
+                    self._count_fps(ts, True)
+            except Exception as e:
+                print(f'Encode error: {e}')
 
     def _count_fps(self, now, real):
         """Track and periodically log the actual capture rate. `real` is False
@@ -526,6 +563,8 @@ class ScreenCapture(threading.Thread):
 
     def run(self):
         self._running = True
+        # Encode worker runs alongside so the capture path never blocks on JPEG
+        threading.Thread(target=self._encode_worker, daemon=True).start()
         # Windows Graphics Capture first — it's the only one of these that grabs
         # fullscreen games at their real framerate (dxcam/mss capture the
         # composited desktop, which fullscreen games bypass). Fall back through
@@ -568,9 +607,10 @@ class ScreenCapture(threading.Thread):
                         self._safe_fps(bc)) != cur
 
             def on_frame_arrived(frame, capture_control):
-                # Runs on the capture's own thread. WGC delivers a frame each
-                # time the screen changes (paced to the fps cap above), so a
-                # fullscreen game is captured at its real rate.
+                # Runs on WGC's own delivery thread — it must stay fast, or WGC
+                # throttles its delivery rate (this was capping fullscreen games
+                # to a fraction of their real fps). So we only copy the pixels
+                # and hand them to the encode worker; the JPEG happens there.
                 if not self._running or _changed():
                     try:
                         capture_control.stop()
@@ -582,16 +622,9 @@ class ScreenCapture(threading.Thread):
                     st['clip_length'] = float(bc.clip_length)
                 except (TypeError, ValueError):
                     st['clip_length'] = 60.0
-                try:
-                    ok, buf = cv2.imencode('.jpg', frame.frame_buffer,
-                                           [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                    if ok:
-                        st['last_jpeg'] = buf.tobytes()
-                        self._append(now, st['last_jpeg'], st['clip_length'])
-                        st['last_store'] = now
-                        self._count_fps(now, True)
-                except Exception as e:
-                    print(f'WGC encode error: {e}')
+                # copy() because WGC reuses the frame buffer after this returns
+                self._queue_encode(now, frame.frame_buffer.copy(), st['clip_length'])
+                st['last_store'] = now
 
             def on_closed():
                 pass
@@ -610,10 +643,9 @@ class ScreenCapture(threading.Thread):
             while self._running and not _changed():
                 time.sleep(0.1)
                 now = time.time()
-                if st['last_jpeg'] is not None and now - st['last_store'] >= self.HEARTBEAT:
-                    self._append(now, st['last_jpeg'], st['clip_length'])
+                if now - st['last_store'] >= self.HEARTBEAT:
+                    self._queue_encode(now, None, st['clip_length'])  # heartbeat
                     st['last_store'] = now
-                    self._count_fps(now, False)
 
             try:
                 ctrl.stop()

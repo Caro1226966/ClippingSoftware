@@ -8,11 +8,16 @@ import traceback
 # to a log file instead: printing to a missing stdout would otherwise crash it,
 # and this gives users something to look at when something goes wrong.
 if IS_FROZEN:
-    try:
-        sys.stdout = sys.stderr = open(LOG_PATH, 'a', buffering=1,
-                                       encoding='utf-8', errors='replace')
-    except Exception:
-        pass
+    # Start a fresh log each launch, and retry a few times: right after an
+    # update the previous copy may still be shutting down and holding the file,
+    # which used to leave the new version with no log at all.
+    for _attempt in range(8):
+        try:
+            sys.stdout = sys.stderr = open(LOG_PATH, 'w', buffering=1,
+                                           encoding='utf-8', errors='replace')
+            break
+        except Exception:
+            time.sleep(0.5)
 
 _instance_mutex = None
 SHOW_EVENT_NAME = 'Caro122ClippingSoftwareShow'
