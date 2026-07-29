@@ -487,9 +487,10 @@ class ScreenCapture(threading.Thread):
     # Windows scheduling constants. A demanding game running flat-out will
     # otherwise starve our capture/encode threads of CPU time slices, which
     # shows up as the capture stalling for a second at a time then bursting.
-    # Nudging the recorder above the game's default (Normal) priority keeps it
-    # scheduled without meaningfully slowing the game (it uses little total CPU).
-    ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+    # Run the recorder at High priority so it always gets scheduled ahead of the
+    # game (which runs at Normal). The recorder is lightweight, so the game takes
+    # only a small hit — an acceptable trade for frames that don't drop.
+    HIGH_PRIORITY_CLASS = 0x00000080
     THREAD_PRIORITY_HIGHEST = 2
     # Documented Win32 pseudo-handles for "current process/thread". Using these
     # directly (as pointer-sized values) avoids the 64-bit handle-truncation
@@ -503,7 +504,7 @@ class ScreenCapture(threading.Thread):
             fn = ctypes.windll.kernel32.SetPriorityClass
             fn.argtypes = [ctypes.c_void_p, ctypes.c_uint]
             if not fn(ScreenCapture._CURRENT_PROCESS,
-                      ScreenCapture.ABOVE_NORMAL_PRIORITY_CLASS):
+                      ScreenCapture.HIGH_PRIORITY_CLASS):
                 print('Priority boost (process): SetPriorityClass returned 0')
         except Exception as e:
             print(f'Priority boost (process) skipped: {e}')
