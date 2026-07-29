@@ -185,6 +185,9 @@ def _verify_encoder(flags):
 
 # Absolute path to the bundled ffmpeg so it resolves no matter the launch directory
 FFMPEG_PATH = resource_path('bin', 'ffmpeg.exe')
+# Native WGC -> on-GPU hardware-encode recorder (the SteelSeries-style path that
+# survives a GPU-maxing game). Drives the replay-buffer segment ring.
+WGCREC_PATH = resource_path('bin', 'wgcrec.exe')
 
 # Pick the encoder now (verifying the GPU one actually works), so the cost is
 # paid once at startup rather than on every clip.

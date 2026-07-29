@@ -1,0 +1,10 @@
+[package]
+name = "wgcrec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows-capture = "2.0.0"
+
+[profile.release]
+opt-level = 2

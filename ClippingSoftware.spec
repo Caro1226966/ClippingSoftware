@@ -7,7 +7,7 @@ Output:       dist\\ClippingSoftware.exe
 from PyInstaller.utils.hooks import collect_all
 
 # ffmpeg is invoked as a subprocess, so it ships alongside the code.
-datas = [('bin/ffmpeg.exe', 'bin'), ('defaults.csv', '.')]
+datas = [('bin/ffmpeg.exe', 'bin'), ('bin/wgcrec.exe', 'bin'), ('defaults.csv', '.')]
 binaries = []
 hiddenimports = [
     'pystray._win32',      # tray backend is picked at runtime
