@@ -1,6 +1,7 @@
 from config import *
 from button_callbacks import *
 from clip_browser import ClipBrowser
+from gpu_recorder import GpuRecorder
 import queue
 import traceback
 
@@ -113,8 +114,17 @@ class MainProgram(customtkinter.CTk):
         # Rolling audio capture (mic + computer audio)
         self.audio = AudioManager(self)
 
-        # Threaded screen capture (keeps the grab/encode off the GUI thread)
+        # Threaded screen capture (keeps the grab/encode off the GUI thread).
+        # This is the CPU path, used as a fallback.
         self.screen = ScreenCapture(self)
+
+        # GPU-native replay buffer (ddagrab + hardware NVENC/AMF/QSV). When a
+        # hardware encoder is present this is used instead of self.screen: capture
+        # and encode both stay on the GPU, so a game maxing the graphics cores
+        # can't starve it the way the CPU readback path gets starved. It falls
+        # back to self.screen automatically if it can't start.
+        self.gpu = GpuRecorder(self)
+        self.use_gpu = self.gpu._uses_hw()
 
         # The clip browser window (opened from the little video icon).
         # The button itself is created last so it stacks above everything else.
@@ -331,7 +341,11 @@ class MainProgram(customtkinter.CTk):
 
         # Starts the audio + screen recording
         self.audio.start()
-        self.screen.start()
+        if self.use_gpu:
+            self.gpu.start()
+            threading.Thread(target=self._gpu_fallback_watch, daemon=True).start()
+        else:
+            self.screen.start()
 
         # Built to sit in Startup: stay out of the way and run from the tray.
         # The window is only shown on the very first launch (so a new user can
@@ -368,12 +382,33 @@ class MainProgram(customtkinter.CTk):
         # ~66Hz key polling is plenty responsive and costs the GUI almost nothing
         self.after(15,self.loop)
 
+    def _gpu_fallback_watch(self):
+        """If the GPU replay buffer can't get going within a few seconds (no
+        ddagrab / hardware encoder), quietly switch to the CPU capture path so
+        recording still works."""
+        for _ in range(12):
+            if self.gpu.available:
+                return
+            if not self.gpu.is_alive():
+                break
+            time.sleep(0.5)
+        if not self.gpu.available:
+            print('GPU recorder unavailable — falling back to CPU capture')
+            self.use_gpu = False
+            self.screen.start()
+
     def _start_clip(self):
         print('Clipping...')
         try:
             Popup()
         except Exception as e:
             print(f'Popup error: {e}')  # a failed popup must not stop the clip
+
+        # GPU path: the video is already encoded in the rolling buffer, so we
+        # just trim the last N seconds and mux in the matching audio.
+        if self.use_gpu and self.gpu.available:
+            self._start_gpu_clip()
+            return
 
         # Grab the buffered frames (this also clears the rolling buffer)
         items, t_first, t_last = self.screen.snapshot()
@@ -388,6 +423,38 @@ class MainProgram(customtkinter.CTk):
         threading.Thread(target=self.compile_clip,
                          args=(items, t_first, t_last, clip_audio),
                          daemon=True).start()
+
+    def _start_gpu_clip(self):
+        clip_length = self.gpu._clip_length()
+        # Audio for the same trailing window the video clip covers
+        t_end = time.time()
+        audio = self.audio.get_clip_audio(t_end - clip_length, t_end)
+        self.audio.clear()
+        out_path = SAVE_LOCATION + str(self.button_callback.create_file_name())
+        threading.Thread(target=self._gpu_save, args=(out_path, audio),
+                         daemon=True).start()
+
+    def _gpu_save(self, out_path, audio):
+        audio_path = None
+        try:
+            if audio is not None and len(audio):
+                audio_path = os.path.join(tempfile.gettempdir(),
+                                          f'clip_audio_{time.time()}.wav')
+                write_wav(audio_path, audio, SAMPLE_RATE)
+        except Exception as e:
+            print(f'Audio write error: {e}')
+            audio_path = None
+        try:
+            ok = self.gpu.save_clip(out_path, audio_path)
+            print('Clipped!' if ok else 'Clip failed')
+        except Exception:
+            traceback.print_exc()
+        finally:
+            if audio_path:
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
 
     def _pump_ui_queue(self):
         while True:
@@ -590,6 +657,7 @@ class MainProgram(customtkinter.CTk):
     def _do_quit(self):
         try:
             self.screen.stop()
+            self.gpu.stop()   # kills the ddagrab/NVENC ffmpeg so it isn't orphaned
             self.audio.stop()
         except Exception:
             pass
