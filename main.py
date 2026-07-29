@@ -383,17 +383,19 @@ class MainProgram(customtkinter.CTk):
         self.after(15,self.loop)
 
     def _gpu_fallback_watch(self):
-        """If the GPU replay buffer can't get going within a few seconds (no
-        ddagrab / hardware encoder), quietly switch to the CPU capture path so
-        recording still works."""
-        for _ in range(12):
+        """Wait for the GPU recorder to actually decide, then only fall back to
+        the CPU path if it truly failed. Waiting on the recorder's own outcome
+        (rather than a fixed short timeout) avoids a race where a slow first
+        segment made us fall back to a capture path that was never started."""
+        for _ in range(50):  # up to ~25s safety cap
             if self.gpu.available:
+                diag('main: using GPU recorder')
                 return
             if not self.gpu.is_alive():
-                break
+                break  # recorder thread exited without becoming available
             time.sleep(0.5)
         if not self.gpu.available:
-            print('GPU recorder unavailable — falling back to CPU capture')
+            diag('main: GPU recorder unavailable -> CPU capture fallback')
             self.use_gpu = False
             self.screen.start()
 
@@ -406,7 +408,11 @@ class MainProgram(customtkinter.CTk):
 
         # GPU path: the video is already encoded in the rolling buffer, so we
         # just trim the last N seconds and mux in the matching audio.
-        if self.use_gpu and self.gpu.available:
+        diag(f'main: clip pressed (use_gpu={self.use_gpu} '
+             f'available={getattr(self.gpu, "available", None)})')
+        # If we're in GPU mode, always let the recorder try — it checks its own
+        # segment ring, so we don't depend on the `available` flag being current.
+        if self.use_gpu:
             self._start_gpu_clip()
             return
 
@@ -447,8 +453,10 @@ class MainProgram(customtkinter.CTk):
         try:
             ok = self.gpu.save_clip(out_path, audio_getter)
             print('Clipped!' if ok else 'Clip failed')
+            diag(f'main: gpu save_clip -> {"ok " + out_path if ok else "FAILED"}')
         except Exception:
             traceback.print_exc()
+            diag(f'main: gpu save_clip EXCEPTION: {traceback.format_exc()[-300:]}')
 
     def _pump_ui_queue(self):
         while True:
