@@ -140,42 +140,73 @@ class GpuRecorder(threading.Thread):
         self._running = False
         self._kill()
 
-    def save_clip(self, out_path, audio_path=None):
+    def save_clip(self, out_path, audio_getter=None):
         """Trim the last clip_length seconds out of the segment ring and mux in
-        audio. Video is copied (no re-encode) so there's no quality loss."""
+        audio. Each h264 segment mp4 starts at PTS 0, so joining them via the mp4
+        concat demuxer produces broken timestamps (freezes / desync). Instead we
+        remux each segment to an MPEG-TS elementary stream and join those with the
+        concat protocol — bulletproof for h264. Video is copied (no re-encode).
+
+        `audio_getter(t0, t1)` returns a wav path for wall-clock window [t0, t1]
+        (or None). We anchor that window to the newest segment's finish time so
+        the audio lines up with the video's actual end instead of 'now'."""
         clip_length = self._clip_length()
+        tmp = []  # temp files to clean up
         try:
             segs = sorted(glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')),
                           key=os.path.getmtime)
         except Exception:
             segs = []
-        # Drop the segment currently being written (no moov atom yet)
         if len(segs) >= 2:
-            segs = segs[:-1]
+            segs = segs[:-1]   # drop the segment currently being written
         if not segs:
             diag('gpu recorder: no segments to clip')
             return False
 
         need = int((clip_length + self.SEGMENT_SECONDS) / self.SEGMENT_SECONDS) + 1
         use = segs[-need:]
+        video_end = max(os.path.getmtime(s) for s in use)  # ~wall-clock end of video
 
-        list_path = os.path.join(self.SEG_DIR, '_concat.txt')
-        full_path = os.path.join(self.SEG_DIR, '_full.mp4')
         try:
-            with open(list_path, 'w', encoding='utf-8') as f:
-                for s in use:
-                    f.write("file '%s'\n" % s.replace('\\', '/'))
+            # 1) remux each segment mp4 -> annexb .ts (copy)
+            ts_parts = []
+            for i, s in enumerate(use):
+                t = os.path.join(self.SEG_DIR, f'_t{i}.ts')
+                r = subprocess.run(
+                    [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+                     '-i', s, '-c', 'copy', '-bsf:v', 'h264_mp4toannexb', t],
+                    creationflags=SUBPROCESS_FLAGS, timeout=30)
+                if r.returncode == 0 and os.path.exists(t):
+                    ts_parts.append(t)
+                    tmp.append(t)
+            if not ts_parts:
+                diag('gpu recorder: no ts parts')
+                return False
+
+            # 2) join the ts parts (concat protocol) into one continuous stream
+            full = os.path.join(self.SEG_DIR, '_full.ts')
+            tmp.append(full)
             r = subprocess.run(
                 [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                 '-f', 'concat', '-safe', '0', '-i', list_path,
-                 '-c', 'copy', full_path],
+                 '-i', 'concat:' + '|'.join(ts_parts), '-c', 'copy', full],
                 creationflags=SUBPROCESS_FLAGS, timeout=60)
-            if r.returncode != 0 or not os.path.exists(full_path):
+            if r.returncode != 0 or not os.path.exists(full):
                 diag('gpu recorder: concat failed')
                 return False
 
+            # 3) audio for the exact video window
+            audio_path = None
+            if audio_getter:
+                try:
+                    audio_path = audio_getter(video_end - clip_length, video_end)
+                except Exception as e:
+                    diag(f'gpu recorder: audio getter error: {e}')
+                if audio_path:
+                    tmp.append(audio_path)
+
+            # 4) take the last clip_length seconds, mux audio
             cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                   '-sseof', f'-{clip_length}', '-i', full_path]
+                   '-sseof', f'-{clip_length}', '-i', full]
             if audio_path and os.path.exists(audio_path):
                 cmd += ['-i', audio_path, '-c:v', 'copy',
                         '-c:a', 'aac', '-b:a', '192k', '-shortest']
@@ -192,7 +223,7 @@ class GpuRecorder(threading.Thread):
             diag(f'gpu recorder: save_clip error: {e}')
             return False
         finally:
-            for p in (list_path, full_path):
+            for p in tmp:
                 try:
                     os.remove(p)
                 except Exception:

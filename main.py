@@ -425,36 +425,30 @@ class MainProgram(customtkinter.CTk):
                          daemon=True).start()
 
     def _start_gpu_clip(self):
-        clip_length = self.gpu._clip_length()
-        # Audio for the same trailing window the video clip covers
-        t_end = time.time()
-        audio = self.audio.get_clip_audio(t_end - clip_length, t_end)
-        self.audio.clear()
         out_path = SAVE_LOCATION + str(self.button_callback.create_file_name())
-        threading.Thread(target=self._gpu_save, args=(out_path, audio),
+        threading.Thread(target=self._gpu_save, args=(out_path,),
                          daemon=True).start()
 
-    def _gpu_save(self, out_path, audio):
-        audio_path = None
+    def _gpu_save(self, out_path):
+        # The recorder decides the exact video window (from the segment ring) and
+        # asks us for the matching audio via this getter, so A/V stay aligned.
+        def audio_getter(t0, t1):
+            try:
+                data = self.audio.get_clip_audio(t0, t1)
+            except Exception as e:
+                print(f'Audio fetch error: {e}')
+                return None
+            if data is not None and len(data):
+                p = os.path.join(tempfile.gettempdir(),
+                                 f'clip_audio_{time.time()}.wav')
+                write_wav(p, data, SAMPLE_RATE)
+                return p
+            return None
         try:
-            if audio is not None and len(audio):
-                audio_path = os.path.join(tempfile.gettempdir(),
-                                          f'clip_audio_{time.time()}.wav')
-                write_wav(audio_path, audio, SAMPLE_RATE)
-        except Exception as e:
-            print(f'Audio write error: {e}')
-            audio_path = None
-        try:
-            ok = self.gpu.save_clip(out_path, audio_path)
+            ok = self.gpu.save_clip(out_path, audio_getter)
             print('Clipped!' if ok else 'Clip failed')
         except Exception:
             traceback.print_exc()
-        finally:
-            if audio_path:
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
 
     def _pump_ui_queue(self):
         while True:
