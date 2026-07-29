@@ -21,7 +21,8 @@ import shutil
 import threading
 import subprocess
 
-from config import WGCREC_PATH, FFMPEG_PATH, APP_DIR, SUBPROCESS_FLAGS, diag
+from config import (WGCREC_PATH, FFMPEG_PATH, APP_DIR, SUBPROCESS_FLAGS,
+                    GPU_CODEC_FLAGS, diag)
 
 
 class GpuRecorder(threading.Thread):
@@ -62,8 +63,14 @@ class GpuRecorder(threading.Thread):
     def run(self):
         self._running = True
         try:
-            shutil.rmtree(self.SEG_DIR, ignore_errors=True)
             os.makedirs(self.SEG_DIR, exist_ok=True)
+            # Clear stale segments but KEEP wgcrec.log (so its raw-fps history
+            # survives an app restart for diagnosis).
+            for f in glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
         except Exception as e:
             diag(f'gpu recorder: cannot make buffer dir: {e}')
             self.available = False
@@ -141,11 +148,9 @@ class GpuRecorder(threading.Thread):
         self._kill()
 
     def save_clip(self, out_path, audio_getter=None):
-        """Trim the last clip_length seconds out of the segment ring and mux in
-        audio. Each h264 segment mp4 starts at PTS 0, so joining them via the mp4
-        concat demuxer produces broken timestamps (freezes / desync). Instead we
-        remux each segment to an MPEG-TS elementary stream and join those with the
-        concat protocol — bulletproof for h264. Video is copied (no re-encode).
+        """Trim the last clip_length seconds out of the segment ring, join it into
+        one continuous stream, and re-encode to a constant frame rate with audio
+        muxed in — producing a smooth, in-sync clip.
 
         `audio_getter(t0, t1)` returns a wav path for wall-clock window [t0, t1]
         (or None). We anchor that window to the newest segment's finish time so
@@ -183,12 +188,20 @@ class GpuRecorder(threading.Thread):
                 diag('gpu recorder: no ts parts')
                 return False
 
-            # 2) join the ts parts (concat protocol) into one continuous stream
+            # 2) join the ts parts with the concat DEMUXER (a list file), which
+            #    offsets each part's timestamps so the joined stream has one
+            #    continuous timeline (the concat protocol left PTS jumps at every
+            #    segment boundary -> a freeze per boundary).
+            list_path = os.path.join(self.SEG_DIR, '_list.txt')
+            tmp.append(list_path)
+            with open(list_path, 'w', encoding='utf-8') as f:
+                for t in ts_parts:
+                    f.write("file '%s'\n" % t.replace('\\', '/'))
             full = os.path.join(self.SEG_DIR, '_full.ts')
             tmp.append(full)
             r = subprocess.run(
                 [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                 '-i', 'concat:' + '|'.join(ts_parts), '-c', 'copy', full],
+                 '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', full],
                 creationflags=SUBPROCESS_FLAGS, timeout=60)
             if r.returncode != 0 or not os.path.exists(full):
                 diag('gpu recorder: concat failed')
@@ -204,20 +217,24 @@ class GpuRecorder(threading.Thread):
                 if audio_path:
                     tmp.append(audio_path)
 
-            # 4) take the last clip_length seconds, mux audio
+            # 4) take the last clip_length seconds and RE-ENCODE to a constant
+            #    frame rate. Copying preserved the segments' variable pacing and
+            #    boundary glitches; a CFR re-encode (on the GPU hardware encoder)
+            #    lays down an even timeline so playback is smooth, and muxes audio.
+            fps = self._fps()
             cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
                    '-sseof', f'-{clip_length}', '-i', full]
             if audio_path and os.path.exists(audio_path):
-                cmd += ['-i', audio_path, '-c:v', 'copy',
-                        '-c:a', 'aac', '-b:a', '192k', '-shortest']
-            else:
-                cmd += ['-c:v', 'copy']
+                cmd += ['-i', audio_path]
+            cmd += ['-vf', f'fps={fps}', *GPU_CODEC_FLAGS, '-pix_fmt', 'yuv420p']
+            if audio_path and os.path.exists(audio_path):
+                cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
             cmd += ['-movflags', '+faststart', out_path]
-            r = subprocess.run(cmd, creationflags=SUBPROCESS_FLAGS, timeout=120)
+            r = subprocess.run(cmd, creationflags=SUBPROCESS_FLAGS, timeout=180)
             ok = r.returncode == 0 and os.path.exists(out_path) \
                 and os.path.getsize(out_path) > 1024
             if not ok:
-                diag('gpu recorder: final mux failed')
+                diag('gpu recorder: final encode failed')
             return ok
         except Exception as e:
             diag(f'gpu recorder: save_clip error: {e}')

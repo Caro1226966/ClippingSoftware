@@ -188,7 +188,7 @@ fn main() {
             TargetId::Window(hwnd) => {
                 let win = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
                 Cap::start(Settings::new(
-                    win, CursorCaptureSettings::WithoutCursor, DrawBorderSettings::WithoutBorder,
+                    win, CursorCaptureSettings::WithCursor, DrawBorderSettings::WithoutBorder,
                     SecondaryWindowSettings::Default, MinimumUpdateIntervalSettings::Default,
                     DirtyRegionSettings::Default, ColorFormat::Rgba8, cfg,
                 ))
@@ -196,7 +196,7 @@ fn main() {
             TargetId::Monitor(idx) => {
                 let mon = Monitor::from_index(idx).unwrap_or_else(|_| Monitor::primary().unwrap());
                 Cap::start(Settings::new(
-                    mon, CursorCaptureSettings::WithoutCursor, DrawBorderSettings::WithoutBorder,
+                    mon, CursorCaptureSettings::WithCursor, DrawBorderSettings::WithoutBorder,
                     SecondaryWindowSettings::Default, MinimumUpdateIntervalSettings::Default,
                     DirtyRegionSettings::Default, ColorFormat::Rgba8, cfg,
                 ))
