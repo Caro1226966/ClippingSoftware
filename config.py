@@ -73,6 +73,44 @@ class _RECT(ctypes.Structure):
     _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
                 ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
 
+
+# --- Composed-flip / MPO control -------------------------------------------
+# A game in "independent flip" (MPO) mode scans out directly and bypasses the
+# desktop compositor, so screen capture only sees ~12-18fps of real content.
+# Setting Dwm\OverlayTestMode = 5 disables MPO, forcing "composed flip" — the
+# game renders through the compositor and capture gets the full 60fps. It needs
+# admin (HKLM) and a reboot to take effect, and is fully reversible.
+_MPO_KEY = r'SOFTWARE\Microsoft\Windows\Dwm'
+_MPO_VAL = 'OverlayTestMode'
+
+
+def mpo_disabled():
+    """True if MPO is currently disabled (OverlayTestMode = 5)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MPO_KEY) as k:
+            v, _ = winreg.QueryValueEx(k, _MPO_VAL)
+            return int(v) == 5
+    except Exception:
+        return False
+
+
+def set_mpo_disabled(disabled):
+    """Enable/disable MPO by writing HKLM via an elevated helper (UAC prompt).
+    Returns True if the registry now matches the requested state."""
+    if disabled:
+        inner = f'reg add "HKLM\\{_MPO_KEY}" /v {_MPO_VAL} /t REG_DWORD /d 5 /f'
+    else:
+        inner = f'reg delete "HKLM\\{_MPO_KEY}" /v {_MPO_VAL} /f'
+    ps = (f"Start-Process cmd -ArgumentList '/c {inner}' -Verb RunAs "
+          f"-WindowStyle Hidden -Wait")
+    try:
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                       creationflags=SUBPROCESS_FLAGS, timeout=120)
+    except Exception as e:
+        print(f'MPO change error: {e}')
+    return mpo_disabled() == bool(disabled)
+
 # First launch on this machine: seed the settings file from the bundled defaults
 FIRST_RUN = not os.path.exists(CONFIG_PATH)
 if FIRST_RUN:

@@ -325,6 +325,25 @@ class MainProgram(customtkinter.CTk):
         else:
             self.mouse_tick_box.deselect()
 
+        # Row: "Smooth game capture" — disables MPO (independent flip) so games
+        # render through the compositor and capture gets a full 60fps. Reversible;
+        # needs admin + a reboot.
+        self.mpo_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
+        self.mpo_row.pack(anchor="w", fill="x", pady=(0, 12))
+        self.mpo_text = customtkinter.CTkLabel(self.mpo_row, width=200, height=30,
+                                               text='Smooth game capture: ')
+        self.mpo_text.pack(side='left', anchor="w", padx=0, pady=0)
+        self.mpo_text.configure(state="disabled")
+        self.mpo_tick_box = customtkinter.CTkCheckBox(self.mpo_row, width=60, height=60,
+                                                      state='normal',
+                                                      command=self.button_callback.mpo_status_updater,
+                                                      text='', onvalue=1, offvalue=0, hover=True)
+        self.mpo_tick_box.pack(side='left', anchor='w', pady=0, padx=10)
+        if mpo_disabled():
+            self.mpo_tick_box.select()
+        else:
+            self.mpo_tick_box.deselect()
+
         # Clip-browser button — created last and lifted so it always sits on top
         # of the other widgets, tucked into the top-right corner clear of the row
         self._clips_icon = customtkinter.CTkImage(light_image=_make_clips_icon(),

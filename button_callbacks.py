@@ -167,6 +167,35 @@ class Callbacks:
         self.main.write_to_file('mouse_enabled', self.mouse_enabled)
         # The capture thread reads self.mouse_enabled live, so it takes effect at once
 
+    def mpo_status_updater(self):
+        """Toggle 'Smooth game capture' — disables/enables MPO (independent flip)
+        so games render through the compositor and capture gets the full 60fps.
+        Needs admin (UAC) and a reboot to take effect; fully reversible."""
+        import tkinter.messagebox as mb
+        want = bool(self.main.mpo_tick_box.get())
+        ok = set_mpo_disabled(want)
+        if ok:
+            if want:
+                mb.showinfo('Restart to finish',
+                            'Smooth game capture is ON.\n\nRestart your PC for it to '
+                            'take effect. After that, games record at full 60fps.')
+            else:
+                mb.showinfo('Restart to finish',
+                            'Smooth game capture is OFF (back to Windows default).\n\n'
+                            'Restart your PC for it to take effect.')
+        else:
+            mb.showwarning('Not applied',
+                           'Could not change the setting — admin permission is needed '
+                           '(the Windows prompt must be accepted).')
+        # Reflect the real registry state on the checkbox
+        try:
+            if mpo_disabled():
+                self.main.mpo_tick_box.select()
+            else:
+                self.main.mpo_tick_box.deselect()
+        except Exception:
+            pass
+
     def getaudio(self,choice):
         input_mics = []
 
