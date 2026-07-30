@@ -45,14 +45,14 @@ struct Cfg {
 struct Cap {
     cfg: Cfg,
     encoder: Option<VideoEncoder>,
-    seg_index: u32,
+    seg_index: u64,   // MONOTONIC counter (never wraps) so filename order == capture order
     seg_start: Instant,
     seg_frames: u64,
 }
 
 impl Cap {
-    fn open(dir: &str, index: u32, w: u32, h: u32, fps: u32) -> Result<VideoEncoder, Box<dyn std::error::Error + Send + Sync>> {
-        let path = format!("{}/seg{:04}.mp4", dir, index);
+    fn open(dir: &str, index: u64, w: u32, h: u32, fps: u32) -> Result<VideoEncoder, Box<dyn std::error::Error + Send + Sync>> {
+        let path = format!("{}/seg{:010}.mp4", dir, index);
         let _ = std::fs::remove_file(&path);
         Ok(VideoEncoder::new(
             // H.264 (not the crate's HEVC default) — light to decode, universally playable.
@@ -83,12 +83,17 @@ impl GraphicsCaptureApiHandler for Cap {
         if elapsed >= self.cfg.seg_seconds {
             log_line(&self.cfg.dir, &format!("seg {} : {} frames in {:.2}s = {:.1} fps",
                 self.seg_index, self.seg_frames, elapsed, self.seg_frames as f64 / elapsed));
-            // Open the next segment, swap, finish the old one OFF-thread so the
-            // capture thread never stalls on the moov write.
-            let next = (self.seg_index + 1) % self.cfg.ring;
+            // Open the next segment (monotonic index), swap, finish the old one
+            // OFF-thread so the capture thread never stalls on the moov write.
+            let next = self.seg_index + 1;
             let new_enc = Cap::open(&self.cfg.dir, next, self.cfg.w, self.cfg.h, self.cfg.fps)?;
             if let Some(old) = self.encoder.replace(new_enc) {
                 std::thread::spawn(move || { let _ = old.finish(); });
+            }
+            // Keep only the last `ring` segments on disk.
+            if next >= self.cfg.ring as u64 {
+                let old_idx = next - self.cfg.ring as u64;
+                let _ = std::fs::remove_file(format!("{}/seg{:010}.mp4", self.cfg.dir, old_idx));
             }
             self.seg_index = next;
             self.seg_start = Instant::now();

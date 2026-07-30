@@ -157,9 +157,17 @@ class GpuRecorder(threading.Thread):
         the audio lines up with the video's actual end instead of 'now'."""
         clip_length = self._clip_length()
         tmp = []  # temp files to clean up
+
+        def _seg_num(p):
+            d = ''.join(c for c in os.path.basename(p) if c.isdigit())
+            return int(d) if d else 0
         try:
+            # Sort by the monotonic segment number in the filename — that IS the
+            # capture order. (mtime is unreliable: each segment's final write
+            # happens on a background thread, so mtimes can shuffle -> the clip
+            # jumps around in time.)
             segs = sorted(glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')),
-                          key=os.path.getmtime)
+                          key=_seg_num)
         except Exception:
             segs = []
         if len(segs) >= 2:
@@ -220,16 +228,19 @@ class GpuRecorder(threading.Thread):
                 if audio_path:
                     tmp.append(audio_path)
 
-            # 4) mux audio over the joined video. The segments carry their real
-            #    capture timestamps and join into one continuous real-time
-            #    timeline, so we copy the video as-is (lossless, no re-encode) —
-            #    no resampling means no stutter and the audio stays in sync.
-            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-i', full]
+            # 4) re-encode the joined video and mux audio. Copying the raw h264
+            #    across independent-segment boundaries left torn/garbage frames
+            #    (broken inter-frame references); a decode+re-encode rebuilds every
+            #    frame cleanly. '-fps_mode passthrough' keeps each frame's REAL
+            #    timestamp (no resampling) so it stays smooth and in sync — unlike
+            #    forcing CFR, which duplicated frames and drifted the audio.
+            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
+                   '-fflags', '+genpts', '-i', full]
             if audio_path and os.path.exists(audio_path):
-                cmd += ['-i', audio_path, '-c:v', 'copy',
-                        '-c:a', 'aac', '-b:a', '192k', '-shortest']
-            else:
-                cmd += ['-c:v', 'copy']
+                cmd += ['-i', audio_path]
+            cmd += ['-fps_mode', 'passthrough', *GPU_CODEC_FLAGS, '-pix_fmt', 'yuv420p']
+            if audio_path and os.path.exists(audio_path):
+                cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
             cmd += ['-movflags', '+faststart', out_path]
             r = subprocess.run(cmd, creationflags=SUBPROCESS_FLAGS, timeout=120)
             ok = r.returncode == 0 and os.path.exists(out_path) \
