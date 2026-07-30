@@ -152,10 +152,10 @@ class MainProgram(customtkinter.CTk):
         self.monitor_row = customtkinter.CTkFrame(self.left_column, fg_color="transparent")
         self.monitor_row.pack(anchor="w", fill="x", pady=(0, 12))
 
-        # Monitor selector
+        # Monitor selector — label them 1-based ("Monitor 1", "Monitor 2") to
+        # match how Windows numbers displays, while the stored value stays 0-based.
         for monitor in range(len(self.sct.monitors)-1):
-            monitor_num = str(monitor)
-            (self.monitor_list.append(monitor_num))
+            self.monitor_list.append(f'Monitor {monitor + 1}')
 
         # Text to show user that dropdown selects the monitor
         self.current_monitor_text = customtkinter.CTkLabel(self.monitor_row,width=200, height=30, text='Monitor: ')
@@ -165,7 +165,10 @@ class MainProgram(customtkinter.CTk):
         self.monitor_selector = customtkinter.CTkComboBox(self.monitor_row,values=self.monitor_list,
                                                           command=self.button_callback.selectmonitor,
                                                           state ='readonly')
-        self.monitor_selector.set(self.read_from_file('monitor'))
+        try:
+            self.monitor_selector.set(f"Monitor {int(self.read_from_file('monitor')) + 1}")
+        except (TypeError, ValueError):
+            self.monitor_selector.set(self.monitor_list[0] if self.monitor_list else 'Monitor 1')
         self.monitor_selector.pack(side = 'left', anchor='w',pady = 0, padx = 10)
 
         # Row for monitor selector UI elements to sit in

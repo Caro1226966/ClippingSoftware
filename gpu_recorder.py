@@ -60,75 +60,75 @@ class GpuRecorder(threading.Thread):
         # Windows GPU; we always prefer it and fall back only if it fails to run.
         return True
 
-    def run(self):
-        self._running = True
-        try:
-            os.makedirs(self.SEG_DIR, exist_ok=True)
-            # Clear stale segments but KEEP wgcrec.log (so its raw-fps history
-            # survives an app restart for diagnosis).
-            for f in glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-        except Exception as e:
-            diag(f'gpu recorder: cannot make buffer dir: {e}')
-            self.available = False
-            return
+    def _current_args(self):
+        """The settings the recorder depends on (monitor, fps, clip length). Read
+        live so changing any of them restarts the capture with the new value —
+        monitor/fps change what's captured, clip length changes the ring size."""
+        return (self._fallback_monitor(), self._fps(), self._clip_length())
 
-        ring = int((self._clip_length() + self.RING_MARGIN) / self.SEGMENT_SECONDS) + 2
-        cmd = [WGCREC_PATH, self.SEG_DIR, str(self._fallback_monitor()),
-               str(self.SEGMENT_SECONDS), str(ring), str(self._fps())]
+    def _launch(self):
+        """(Re)start wgcrec for the current monitor/fps. Clears the ring first
+        (a new monitor may be a different size). Returns True once it's producing
+        segments."""
+        for f in glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        mon, fps, clip_len = self._current_args()
+        ring = int((clip_len + self.RING_MARGIN) / self.SEGMENT_SECONDS) + 2
+        cmd = [WGCREC_PATH, self.SEG_DIR, str(mon),
+               str(self.SEGMENT_SECONDS), str(ring), str(fps)]
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.PIPE,
                                          creationflags=SUBPROCESS_FLAGS)
         except Exception as e:
             diag(f'gpu recorder: wgcrec launch failed: {e}')
-            self.available = False
-            return
-
-        # Wait for it to actually start producing segments; if it can't (no WGC /
-        # no hardware encoder), give up so the app falls back to the CPU path.
-        for _ in range(20):  # ~10s
+            return False
+        for _ in range(20):  # ~10s to produce the first segment
             if self.proc.poll() is not None:
-                err = b''
-                try:
-                    err = self.proc.stderr.read() or b''
-                except Exception:
-                    pass
-                diag(f'gpu recorder: wgcrec exited early: '
-                     f'{err.decode("utf-8", "replace")[:200]}')
-                self.available = False
-                return
+                diag('gpu recorder: wgcrec exited early')
+                return False
             if glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')):
                 self.available = True
-                diag('gpu replay buffer live (wgc + hardware encode)')
-                break
+                diag(f'gpu replay buffer live (wgc monitor {mon}, {fps}fps)')
+                return True
             time.sleep(0.5)
-        else:
-            diag('gpu recorder: no segments after 10s, falling back')
-            self._kill()
+        diag('gpu recorder: no segments after 10s')
+        self._kill()
+        return False
+
+    def run(self):
+        self._running = True
+        try:
+            os.makedirs(self.SEG_DIR, exist_ok=True)
+        except Exception as e:
+            diag(f'gpu recorder: cannot make buffer dir: {e}')
             self.available = False
             return
 
-        # Keep the process alive; if it dies, restart it.
+        if not self._launch():
+            self.available = False   # app falls back to the CPU path
+            return
+        launched = self._current_args()
+
+        # Supervise: restart wgcrec if it dies OR the monitor/fps setting changes
+        # (so picking a different monitor in settings takes effect immediately).
         while self._running:
-            if self.proc.poll() is not None:
+            time.sleep(0.5)
+            if self.proc is None or self.proc.poll() is not None:
                 diag('gpu recorder: wgcrec exited, restarting')
                 self.available = False
-                try:
-                    self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                                 stderr=subprocess.PIPE,
-                                                 creationflags=SUBPROCESS_FLAGS)
-                except Exception:
-                    return
-                for _ in range(20):
-                    if glob.glob(os.path.join(self.SEG_DIR, 'seg*.mp4')):
-                        self.available = True
-                        break
-                    time.sleep(0.5)
-            time.sleep(0.5)
+                self._launch()
+                launched = self._current_args()
+            elif self._current_args() != launched:
+                diag(f'gpu recorder: settings changed {launched} -> '
+                     f'{self._current_args()}, restarting on new monitor')
+                self.available = False
+                self._kill()
+                self._launch()
+                launched = self._current_args()
         self._kill()
 
     def _kill(self):

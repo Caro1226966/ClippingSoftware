@@ -61,10 +61,14 @@ class Callbacks:
 
 # Selects the monitor
     def selectmonitor(self, choice):
-        self.monitor = int(choice[-1])
-
-        print(self.monitor)
-        self.main.write_to_file('monitor',str(self.monitor))
+        # choice is like "Monitor 2"; store 0-based so it matches the rest of the
+        # app (the GPU recorder adds 1 for the 1-based WGC monitor index).
+        digits = ''.join(ch for ch in str(choice) if ch.isdigit())
+        self.monitor = (int(digits) - 1) if digits else 0
+        if self.monitor < 0:
+            self.monitor = 0
+        self.main.write_to_file('monitor', str(self.monitor))
+        # The GPU recorder watches this value and restarts on the new monitor.
 
 # Creates the file name based on the time it was taken
     @staticmethod
