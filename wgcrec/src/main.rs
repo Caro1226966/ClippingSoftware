@@ -83,8 +83,8 @@ impl GraphicsCaptureApiHandler for Cap {
         if elapsed >= self.cfg.seg_seconds {
             log_line(&self.cfg.dir, &format!("seg {} : {} frames in {:.2}s = {:.1} fps",
                 self.seg_index, self.seg_frames, elapsed, self.seg_frames as f64 / elapsed));
-            // Rotate: open the next segment, swap, finish the old one OFF-thread so
-            // the capture thread never stalls waiting on the moov write.
+            // Open the next segment, swap, finish the old one OFF-thread so the
+            // capture thread never stalls on the moov write.
             let next = (self.seg_index + 1) % self.cfg.ring;
             let new_enc = Cap::open(&self.cfg.dir, next, self.cfg.w, self.cfg.h, self.cfg.fps)?;
             if let Some(old) = self.encoder.replace(new_enc) {

@@ -168,9 +168,12 @@ class GpuRecorder(threading.Thread):
             diag('gpu recorder: no segments to clip')
             return False
 
-        need = int((clip_length + self.SEGMENT_SECONDS) / self.SEGMENT_SECONDS) + 1
+        need = max(int(round(clip_length / self.SEGMENT_SECONDS)), 1)
         use = segs[-need:]
         video_end = max(os.path.getmtime(s) for s in use)  # ~wall-clock end of video
+        # The video is exactly the span these segments cover; align audio to that
+        # same window (not a fixed clip_length) so the two line up precisely.
+        video_dur = len(use) * self.SEGMENT_SECONDS
 
         try:
             # 1) remux each segment mp4 -> annexb .ts (copy)
@@ -207,34 +210,32 @@ class GpuRecorder(threading.Thread):
                 diag('gpu recorder: concat failed')
                 return False
 
-            # 3) audio for the exact video window
+            # 3) audio for exactly the span the joined video covers
             audio_path = None
             if audio_getter:
                 try:
-                    audio_path = audio_getter(video_end - clip_length, video_end)
+                    audio_path = audio_getter(video_end - video_dur, video_end)
                 except Exception as e:
                     diag(f'gpu recorder: audio getter error: {e}')
                 if audio_path:
                     tmp.append(audio_path)
 
-            # 4) take the last clip_length seconds and RE-ENCODE to a constant
-            #    frame rate. Copying preserved the segments' variable pacing and
-            #    boundary glitches; a CFR re-encode (on the GPU hardware encoder)
-            #    lays down an even timeline so playback is smooth, and muxes audio.
-            fps = self._fps()
-            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error',
-                   '-sseof', f'-{clip_length}', '-i', full]
+            # 4) mux audio over the joined video. The segments carry their real
+            #    capture timestamps and join into one continuous real-time
+            #    timeline, so we copy the video as-is (lossless, no re-encode) —
+            #    no resampling means no stutter and the audio stays in sync.
+            cmd = [FFMPEG_PATH, '-y', '-hide_banner', '-loglevel', 'error', '-i', full]
             if audio_path and os.path.exists(audio_path):
-                cmd += ['-i', audio_path]
-            cmd += ['-vf', f'fps={fps}', *GPU_CODEC_FLAGS, '-pix_fmt', 'yuv420p']
-            if audio_path and os.path.exists(audio_path):
-                cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
+                cmd += ['-i', audio_path, '-c:v', 'copy',
+                        '-c:a', 'aac', '-b:a', '192k', '-shortest']
+            else:
+                cmd += ['-c:v', 'copy']
             cmd += ['-movflags', '+faststart', out_path]
-            r = subprocess.run(cmd, creationflags=SUBPROCESS_FLAGS, timeout=180)
+            r = subprocess.run(cmd, creationflags=SUBPROCESS_FLAGS, timeout=120)
             ok = r.returncode == 0 and os.path.exists(out_path) \
                 and os.path.getsize(out_path) > 1024
             if not ok:
-                diag('gpu recorder: final encode failed')
+                diag('gpu recorder: final mux failed')
             return ok
         except Exception as e:
             diag(f'gpu recorder: save_clip error: {e}')
